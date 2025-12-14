@@ -11,7 +11,7 @@ public sealed class GeneratorService
         _schemaReader = schemaReader;
     }
 
-    public async Task<GeneratorResult> ExecuteAsync(string connectionString, CancellationToken cancellationToken = default)
+    public async Task<GeneratorResult> ExecuteAsync(string connectionString, string outputDirectory, CancellationToken cancellationToken = default)
     {
         var schemaJson = await _schemaReader.ReadSchemaAsync(connectionString, cancellationToken).ConfigureAwait(false);
 

@@ -8,21 +8,21 @@ namespace Host.Controllers;
 public sealed class ExecuteController : ControllerBase
 {
     private readonly GeneratorService _generator;
+    private readonly IConfiguration _config;
 
-    public ExecuteController(GeneratorService generator)
+    public ExecuteController(GeneratorService generator, IConfiguration config)
     {
         _generator = generator;
+        _config = config;
     }
 
     [HttpPost]
-    public async Task<ActionResult<GeneratorResult>> Execute([FromBody] GenerationRequest request)
+    public async Task<ActionResult<GeneratorResult>> Execute()
     {
-        if (string.IsNullOrWhiteSpace(request.ConnectionString))
-        {
-            return BadRequest("A connection string is required.");
-        }
+        string conn = _config.GetConnectionString("DefaultConnection") ?? "";
+        string output = Path.Combine(Directory.GetCurrentDirectory(), "Generated");
 
-        var result = await _generator.ExecuteAsync(request.ConnectionString, HttpContext.RequestAborted);
+        var result = await _generator.ExecuteAsync(conn, output, HttpContext.RequestAborted);
         return Ok(result);
     }
 }
