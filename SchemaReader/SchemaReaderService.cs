@@ -99,7 +99,7 @@ public sealed class SchemaReaderService : ISchemaReader
 
     private static async Task<Dictionary<int, IReadOnlyList<ColumnInfo>>> LoadColumnsAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
-        const string columnSql = @"SELECT c.object_id, c.name, t.name AS data_type, c.is_nullable, OBJECT_DEFINITION(c.default_object_id) AS default_value, c.is_identity, c.is_computed, c.max_length, c.precision, c.scale FROM sys.columns AS c JOIN sys.types AS t ON c.user_type_id = t.user_type_id WHERE c.is_hidden = 0 ORDER BY c.column_id";
+        const string columnSql = @"SELECT c.object_id, c.name, t.name AS data_type, c.is_nullable, OBJECT_DEFINITION(c.default_object_id) AS default_value, c.is_identity, c.is_computed, c.max_length, c.precision, c.scale FROM sys.columns AS c JOIN sys.types AS t ON c.user_type_id = t.user_type_id WHERE ISNULL(COLUMNPROPERTY(c.object_id, c.name, 'IsHidden'), 0) = 0 ORDER BY c.column_id";
 
         var lookup = new Dictionary<int, List<ColumnInfo>>();
         await using var command = CreateCommand(connection, columnSql);
@@ -470,7 +470,7 @@ public sealed class SchemaReaderService : ISchemaReader
 
     private static async Task<Dictionary<(int ObjectId, int ColumnId), string>> LoadColumnNamesByIdAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
-        const string columnSql = "SELECT object_id, column_id, name FROM sys.columns WHERE is_hidden = 0";
+        const string columnSql = "SELECT object_id, column_id, name FROM sys.columns WHERE ISNULL(COLUMNPROPERTY(object_id, name, 'IsHidden'), 0) = 0";
         var map = new Dictionary<(int, int), string>();
 
         await using (var command = CreateCommand(connection, columnSql))
