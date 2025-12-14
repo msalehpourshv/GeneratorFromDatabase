@@ -28,8 +28,10 @@ public sealed class SchemaReaderService : ISchemaReader
         const string schemaSql = "SELECT schema_id, name FROM sys.schemas WHERE schema_id < 16384 ORDER BY name";
         var schemaNames = await ReadSchemasAsync(connection, schemaSql, cancellationToken).ConfigureAwait(false);
 
-        var tableLookup = await LoadTablesAsync(connection, cancellationToken).ConfigureAwait(false);
-        var viewLookup = await LoadViewsAsync(connection, cancellationToken).ConfigureAwait(false);
+        var columns = await LoadColumnsAsync(connection, cancellationToken).ConfigureAwait(false);
+
+        var tableLookup = await LoadTablesAsync(connection, columns, cancellationToken).ConfigureAwait(false);
+        var viewLookup = await LoadViewsAsync(connection, columns, cancellationToken).ConfigureAwait(false);
         var storedProcedures = await LoadStoredProceduresAsync(connection, cancellationToken).ConfigureAwait(false);
         var functions = await LoadFunctionsAsync(connection, cancellationToken).ConfigureAwait(false);
 
@@ -60,7 +62,10 @@ public sealed class SchemaReaderService : ISchemaReader
         return schemaNames;
     }
 
-    private static async Task<Dictionary<int, IReadOnlyList<TableInfo>>> LoadTablesAsync(SqlConnection connection, CancellationToken cancellationToken)
+    private static async Task<Dictionary<int, IReadOnlyList<TableInfo>>> LoadTablesAsync(
+        SqlConnection connection,
+        IReadOnlyDictionary<int, IReadOnlyList<ColumnInfo>> columns,
+        CancellationToken cancellationToken)
     {
         const string tableSql = "SELECT t.object_id, t.schema_id, t.name FROM sys.tables AS t WHERE t.is_ms_shipped = 0 ORDER BY t.name";
         var tables = new List<(int ObjectId, int SchemaId, string Name)>();
@@ -74,7 +79,6 @@ public sealed class SchemaReaderService : ISchemaReader
             }
         }
 
-        var columns = await LoadColumnsAsync(connection, cancellationToken).ConfigureAwait(false);
         var primaryKeys = await LoadPrimaryKeysAsync(connection, cancellationToken).ConfigureAwait(false);
         var foreignKeys = await LoadForeignKeysAsync(connection, cancellationToken).ConfigureAwait(false);
         var indexes = await LoadIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
@@ -324,7 +328,10 @@ public sealed class SchemaReaderService : ISchemaReader
         };
     }
 
-    private static async Task<Dictionary<int, IReadOnlyList<ViewInfo>>> LoadViewsAsync(SqlConnection connection, CancellationToken cancellationToken)
+    private static async Task<Dictionary<int, IReadOnlyList<ViewInfo>>> LoadViewsAsync(
+        SqlConnection connection,
+        IReadOnlyDictionary<int, IReadOnlyList<ColumnInfo>> columns,
+        CancellationToken cancellationToken)
     {
         const string viewSql = "SELECT v.object_id, v.schema_id, v.name, OBJECT_DEFINITION(v.object_id) AS definition FROM sys.views AS v WHERE v.is_ms_shipped = 0";
         var views = new List<(int ObjectId, int SchemaId, string Name, string Definition)>();
@@ -337,8 +344,6 @@ public sealed class SchemaReaderService : ISchemaReader
                 views.Add((reader.GetInt32(0), reader.GetInt32(1), reader.GetString(2), reader.IsDBNull(3) ? string.Empty : reader.GetString(3)));
             }
         }
-
-        var columns = await LoadColumnsAsync(connection, cancellationToken).ConfigureAwait(false);
 
         return views
             .GroupBy(v => v.SchemaId)
