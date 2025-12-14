@@ -13,12 +13,12 @@ public sealed class GeneratorService
 
     public async Task<GeneratorResult> ExecuteAsync(string connectionString, string outputDirectory, CancellationToken cancellationToken = default)
     {
-        var schemaJson = await _schemaReader.ReadSchemaAsync(connectionString, cancellationToken).ConfigureAwait(false);
+        var schema = await _schemaReader.ReadSchemaAsync(connectionString, cancellationToken).ConfigureAwait(false);
 
         return new GeneratorResult
         {
             Status = "Completed",
-            SchemaJson = schemaJson
+            Schema = schema
         };
     }
 }

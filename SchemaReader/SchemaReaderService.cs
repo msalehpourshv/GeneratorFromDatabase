@@ -1,18 +1,16 @@
 using System.Data;
-using System.Text.Json;
 using Microsoft.Data.SqlClient;
 
 namespace SchemaReader;
 
 public sealed class SchemaReaderService : ISchemaReader
 {
-    public async Task<string> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default)
+    public async Task<DatabaseSchema> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default)
     {
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
-        return JsonSerializer.Serialize(schema, new JsonSerializerOptions { WriteIndented = true });
+        return await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)

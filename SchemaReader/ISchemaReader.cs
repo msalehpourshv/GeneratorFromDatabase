@@ -5,5 +5,5 @@ namespace SchemaReader;
 
 public interface ISchemaReader
 {
-    Task<string> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default);
+    Task<DatabaseSchema> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default);
 }
