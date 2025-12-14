@@ -124,7 +124,7 @@ public sealed class SchemaReaderService : ISchemaReader
                 IsComputed = reader.GetBoolean(6),
                 MaxLength = reader.IsDBNull(7) ? null : Convert.ToInt32(reader.GetInt16(7)),
                 Precision = reader.IsDBNull(8) ? null : reader.GetByte(8),
-                Scale = reader.IsDBNull(9) ? null : reader.GetInt32(9)
+                Scale = reader.IsDBNull(9) ? null : Convert.ToInt32(reader.GetByte(9))
             });
         }
 
@@ -461,7 +461,7 @@ public sealed class SchemaReaderService : ISchemaReader
                 IsNullable = reader.GetBoolean(6),
                 MaxLength = reader.IsDBNull(7) ? null : Convert.ToInt32(reader.GetInt16(7)),
                 Precision = reader.IsDBNull(8) ? null : reader.GetByte(8),
-                Scale = reader.IsDBNull(9) ? null : reader.GetInt32(9)
+                Scale = reader.IsDBNull(9) ? null : Convert.ToInt32(reader.GetByte(9))
             });
         }
 
