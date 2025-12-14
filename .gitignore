@@ -1,0 +1,79 @@
+# Build results
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# VS Code
+.vscode/
+
+# .NET tooling
+*.cache
+*.log
+*.tlog
+
+# Auto-generated
+*_i.c
+*_p.c
+*.ilk
+*.meta
+*.obj
+*.pch
+*.pdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlh
+*.tli
+*.tmp
+*.tmp_proj
+*.log
+*.vspscc
+*_i.asm
+*_p.asm
+*.cachefile
+*.dbmdl
+*.bak
+*.backup
+*.BLOB
+*.swp
+*.DS_Store
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+project.lock.json
+typeproviders
+.nuget/
+
+# Resharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Rider
+.idea/
+*.sln.iml
+
+# ASP.NET Scaffolding
+ScaffoldingReadMe.txt
+
+# Coverage
+coverage*
+*.coverage
+*.coveragexml
+
+# Publish outputs
+wwwroot/
+*.Publish.xml
+*.pubxml
+*.publishsettings
+
+# Azure
+*.azurePubxml
+
