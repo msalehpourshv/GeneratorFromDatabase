@@ -1,16 +1,45 @@
 using System.Data;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
 
 namespace SchemaReader;
 
 public sealed class SchemaReaderService : ISchemaReader
 {
+    private const string CachePrefix = "schema";
+
+    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.General)
+    {
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = false
+    };
+
+    private readonly IDistributedCache _cache;
+    private readonly ILogger<SchemaReaderService> _logger;
+
+    public SchemaReaderService(IDistributedCache cache, ILogger<SchemaReaderService> logger)
+    {
+        _cache = cache;
+        _logger = logger;
+    }
+
     public async Task<DatabaseSchema> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default)
     {
-        await using var connection = new SqlConnection(connectionString);
+        var connectionBuilder = new SqlConnectionStringBuilder(connectionString);
+        var cacheKey = BuildCacheKey(connectionBuilder);
+
+        var cached = await TryReadFromCacheAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+        if (cached is not null)
+        {
+            return cached;
+        }
+
+        await using var connection = new SqlConnection(connectionBuilder.ConnectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
@@ -21,7 +50,59 @@ public sealed class SchemaReaderService : ISchemaReader
             schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
         }
 
+        await WriteToCacheAsync(cacheKey, schema, cancellationToken).ConfigureAwait(false);
+
         return schema;
+    }
+
+    private static string BuildCacheKey(SqlConnectionStringBuilder builder)
+    {
+        var dataSource = string.IsNullOrWhiteSpace(builder.DataSource)
+            ? "unknown"
+            : builder.DataSource.Replace(':', '_').Replace('\\', '_').Replace('/', '_');
+
+        var database = string.IsNullOrWhiteSpace(builder.InitialCatalog)
+            ? "default"
+            : builder.InitialCatalog;
+
+        return $"{CachePrefix}:{dataSource}:{database}";
+    }
+
+    private async Task<DatabaseSchema?> TryReadFromCacheAsync(string cacheKey, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var cached = await _cache.GetStringAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(cached))
+            {
+                return null;
+            }
+
+            return JsonSerializer.Deserialize<DatabaseSchema>(cached, SerializerOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to read schema cache for key {CacheKey}", cacheKey);
+            return null;
+        }
+    }
+
+    private async Task WriteToCacheAsync(string cacheKey, DatabaseSchema schema, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var serialized = JsonSerializer.Serialize(schema, SerializerOptions);
+            var options = new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(12)
+            };
+
+            await _cache.SetStringAsync(cacheKey, serialized, options, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to write schema cache for key {CacheKey}", cacheKey);
+        }
     }
 
     private static async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
