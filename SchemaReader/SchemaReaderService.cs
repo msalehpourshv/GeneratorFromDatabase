@@ -1,4 +1,7 @@
 using System.Data;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
 
 namespace SchemaReader;
@@ -10,7 +13,15 @@ public sealed class SchemaReaderService : ISchemaReader
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        return await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+        var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+
+        var databaseDirectory = ResolveDatabaseDirectory(connection.Database);
+        if (databaseDirectory is not null)
+        {
+            schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
+        }
+
+        return schema;
     }
 
     private static async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
@@ -511,5 +522,381 @@ public sealed class SchemaReaderService : ISchemaReader
         {
             CommandTimeout = 60
         };
+    }
+
+    private static string? ResolveDatabaseDirectory(string databaseName)
+    {
+        if (string.IsNullOrWhiteSpace(databaseName))
+        {
+            return null;
+        }
+
+        var folder = Path.Combine(AppContext.BaseDirectory, "databases", databaseName);
+        return Directory.Exists(folder) ? folder : null;
+    }
+
+    private static async Task<DatabaseSchema> ApplyDatabaseFilesAsync(DatabaseSchema schema, string databaseDirectory, CancellationToken cancellationToken)
+    {
+        var definitions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.EnumerateFiles(databaseDirectory, "*.sql", SearchOption.TopDirectoryOnly))
+        {
+            var name = Path.GetFileNameWithoutExtension(file);
+            var content = await File.ReadAllTextAsync(file, cancellationToken).ConfigureAwait(false);
+            definitions[name] = content;
+        }
+
+        var schemas = schema.Schemas
+            .Select(s => UpdateSchemaFromFiles(s, definitions))
+            .ToArray();
+
+        return new DatabaseSchema
+        {
+            Connection = schema.Connection,
+            Schemas = schemas
+        };
+    }
+
+    private static SchemaInfo UpdateSchemaFromFiles(SchemaInfo schema, IReadOnlyDictionary<string, string> definitions)
+    {
+        var views = schema.Views
+            .Select(v => UpdateView(v, schema.Name, definitions))
+            .ToArray();
+
+        var storedProcedures = schema.StoredProcedures
+            .Select(p => UpdateStoredProcedure(p, schema.Name, definitions))
+            .ToArray();
+
+        var functions = schema.Functions
+            .Select(f => UpdateFunction(f, schema.Name, definitions))
+            .ToArray();
+
+        return new SchemaInfo
+        {
+            Name = schema.Name,
+            Tables = schema.Tables,
+            Views = views,
+            StoredProcedures = storedProcedures,
+            Functions = functions
+        };
+    }
+
+    private static ViewInfo UpdateView(ViewInfo view, string schemaName, IReadOnlyDictionary<string, string> definitions)
+    {
+        var key = $"{schemaName}.{view.Name}";
+        if (!definitions.TryGetValue(key, out var definition))
+        {
+            return view;
+        }
+
+        return new ViewInfo
+        {
+            Name = view.Name,
+            Definition = definition,
+            Columns = view.Columns
+        };
+    }
+
+    private static StoredProcedureInfo UpdateStoredProcedure(StoredProcedureInfo procedure, string schemaName, IReadOnlyDictionary<string, string> definitions)
+    {
+        var key = $"{schemaName}.{procedure.Name}";
+        if (!definitions.TryGetValue(key, out var definition))
+        {
+            return procedure;
+        }
+
+        var parameters = ParseParameters(definition, procedure.Parameters, isFunction: false);
+
+        return new StoredProcedureInfo
+        {
+            Name = procedure.Name,
+            Definition = definition,
+            Parameters = parameters
+        };
+    }
+
+    private static FunctionInfo UpdateFunction(FunctionInfo function, string schemaName, IReadOnlyDictionary<string, string> definitions)
+    {
+        var key = $"{schemaName}.{function.Name}";
+        if (!definitions.TryGetValue(key, out var definition))
+        {
+            return function;
+        }
+
+        var parameters = ParseParameters(definition, function.Parameters, isFunction: true);
+
+        return new FunctionInfo
+        {
+            Name = function.Name,
+            Definition = definition,
+            ReturnType = function.ReturnType,
+            Parameters = parameters
+        };
+    }
+
+    private static IReadOnlyList<ParameterInfo> ParseParameters(string definition, IReadOnlyList<ParameterInfo> existingParameters, bool isFunction)
+    {
+        var parsed = ParameterParser.Parse(definition, isFunction);
+        if (parsed.Count == 0)
+        {
+            return existingParameters;
+        }
+
+        var existingLookup = existingParameters.ToDictionary(p => NormalizeParameterName(p.Name), p => p, StringComparer.OrdinalIgnoreCase);
+
+        var merged = new List<ParameterInfo>();
+        foreach (var param in parsed)
+        {
+            existingLookup.TryGetValue(NormalizeParameterName(param.Name), out var existing);
+            merged.Add(param.Merge(existing));
+        }
+
+        return merged;
+    }
+
+    private static string NormalizeParameterName(string name)
+    {
+        var normalized = name.Trim();
+        if (normalized.StartsWith("@", StringComparison.Ordinal))
+        {
+            normalized = normalized[1..];
+        }
+
+        return normalized.Trim('[', ']');
+    }
+
+    private sealed record ParsedParameter(
+        string Name,
+        string? DataType,
+        bool? IsOutput,
+        bool? IsNullable,
+        int? MaxLength,
+        byte? Precision,
+        int? Scale,
+        string? DefaultValue)
+    {
+        public ParameterInfo Merge(ParameterInfo? existing)
+        {
+            return new ParameterInfo
+            {
+                Name = FormatName(Name),
+                DataType = DataType ?? existing?.DataType ?? string.Empty,
+                IsOutput = IsOutput ?? existing?.IsOutput ?? false,
+                IsNullable = IsNullable ?? existing?.IsNullable ?? false,
+                MaxLength = MaxLength ?? existing?.MaxLength,
+                Precision = Precision ?? existing?.Precision,
+                Scale = Scale ?? existing?.Scale,
+                DefaultValue = DefaultValue ?? existing?.DefaultValue
+            };
+        }
+
+        private static string FormatName(string name)
+        {
+            var formatted = name.Trim();
+            if (!formatted.StartsWith("@", StringComparison.Ordinal))
+            {
+                formatted = "@" + formatted;
+            }
+
+            return formatted.Trim('[', ']');
+        }
+    }
+
+    private static class ParameterParser
+    {
+        public static List<ParsedParameter> Parse(string definition, bool isFunction)
+        {
+            var header = isFunction
+                ? ExtractFunctionHeader(definition)
+                : ExtractProcedureHeader(definition);
+
+            if (header is null)
+            {
+                return [];
+            }
+
+            var parametersText = CleanupHeader(header);
+            var segments = SplitParameters(parametersText);
+
+            return segments
+                .Select(ParseSegment)
+                .Where(p => p is not null)
+                .Select(p => p!)
+                .ToList();
+        }
+
+        private static string? ExtractProcedureHeader(string definition)
+        {
+            var match = Regex.Match(definition, "(?is)\\b(?:create|alter)\\s+proc(?:edure)?\\s+[\\w\\.\\[\\]]+\\s*(?<params>.*?)(?=^\\s*as\\b)", RegexOptions.Multiline);
+            return match.Success ? match.Groups["params"].Value : null;
+        }
+
+        private static string? ExtractFunctionHeader(string definition)
+        {
+            var match = Regex.Match(definition, "(?is)\\b(?:create|alter)\\s+function\\s+[\\w\\.\\[\\]]+\\s*(?<params>\\(.*?\\))\\s*(?=returns)");
+            return match.Success ? match.Groups["params"].Value : null;
+        }
+
+        private static string CleanupHeader(string header)
+        {
+            var cleaned = header.Trim();
+            if (cleaned.StartsWith("(") && cleaned.EndsWith(")"))
+            {
+                cleaned = cleaned[1..^1];
+            }
+
+            return cleaned;
+        }
+
+        private static List<string> SplitParameters(string header)
+        {
+            var parameters = new List<string>();
+            var builder = new StringBuilder();
+            var depth = 0;
+
+            foreach (var ch in header)
+            {
+                if (ch == '(')
+                {
+                    depth++;
+                }
+                else if (ch == ')')
+                {
+                    depth = Math.Max(0, depth - 1);
+                }
+
+                if (ch == ',' && depth == 0)
+                {
+                    parameters.Add(builder.ToString());
+                    builder.Clear();
+                    continue;
+                }
+
+                builder.Append(ch);
+            }
+
+            if (builder.Length > 0)
+            {
+                parameters.Add(builder.ToString());
+            }
+
+            return parameters
+                .Select(p => p.Trim())
+                .Where(p => !string.IsNullOrWhiteSpace(p))
+                .ToList();
+        }
+
+        private static ParsedParameter? ParseSegment(string segment)
+        {
+            var trimmed = segment.Trim();
+            if (!trimmed.Contains('@'))
+            {
+                return null;
+            }
+
+            var isOutput = Regex.IsMatch(trimmed, "\\b(out|output)\\b", RegexOptions.IgnoreCase);
+
+            var defaultIndex = FindAssignmentIndex(trimmed);
+            string? defaultValue = null;
+            if (defaultIndex >= 0)
+            {
+                defaultValue = trimmed[(defaultIndex + 1)..].Trim();
+                defaultValue = Regex.Replace(defaultValue, "\\b(out|output)\\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+            }
+
+            var withoutDefault = defaultIndex >= 0 ? trimmed[..defaultIndex] : trimmed;
+            var withoutOutput = Regex.Replace(withoutDefault, "\\b(out|output)\\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+
+            var nameEnd = withoutOutput.IndexOfAny([' ', '\t', '\r', '\n']);
+            var name = nameEnd >= 0 ? withoutOutput[..nameEnd] : withoutOutput;
+            var typeAndModifiers = nameEnd >= 0 ? withoutOutput[nameEnd..].Trim() : string.Empty;
+
+            var (dataType, maxLength, precision, scale, isNullable) = ParseType(typeAndModifiers, defaultValue);
+
+            return new ParsedParameter(name, dataType, isOutput, isNullable, maxLength, precision, scale, defaultValue);
+        }
+
+        private static int FindAssignmentIndex(string segment)
+        {
+            var depth = 0;
+            for (var i = 0; i < segment.Length; i++)
+            {
+                var ch = segment[i];
+                if (ch == '(')
+                {
+                    depth++;
+                }
+                else if (ch == ')')
+                {
+                    depth = Math.Max(0, depth - 1);
+                }
+                else if (ch == '=' && depth == 0)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static (string? DataType, int? MaxLength, byte? Precision, int? Scale, bool? IsNullable) ParseType(string typeAndModifiers, string? defaultValue)
+        {
+            if (string.IsNullOrWhiteSpace(typeAndModifiers))
+            {
+                return (null, null, null, null, null);
+            }
+
+            var nullable = default(bool?);
+            if (Regex.IsMatch(typeAndModifiers, "\\bNOT\\s+NULL\\b", RegexOptions.IgnoreCase))
+            {
+                nullable = false;
+            }
+            else if (Regex.IsMatch(typeAndModifiers, "\\bNULL\\b", RegexOptions.IgnoreCase) || string.Equals(defaultValue, "NULL", StringComparison.OrdinalIgnoreCase))
+            {
+                nullable = true;
+            }
+
+            var cleanedType = Regex.Replace(typeAndModifiers, "\\bNOT\\s+NULL\\b|\\bNULL\\b|\\bREADONLY\\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+
+            int? maxLength = null;
+            byte? precision = null;
+            int? scale = null;
+            string? dataType = cleanedType;
+
+            var openParenIndex = cleanedType.IndexOf('(');
+            if (openParenIndex >= 0)
+            {
+                var closeParenIndex = cleanedType.IndexOf(')', openParenIndex + 1);
+                if (closeParenIndex > openParenIndex)
+                {
+                    var typeName = cleanedType[..openParenIndex].Trim();
+                    var inner = cleanedType[(openParenIndex + 1)..closeParenIndex];
+                    var parts = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length == 1)
+                    {
+                        if (int.TryParse(parts[0], out var len))
+                        {
+                            maxLength = len;
+                        }
+                    }
+                    else if (parts.Length >= 2)
+                    {
+                        if (byte.TryParse(parts[0], out var prec))
+                        {
+                            precision = prec;
+                        }
+
+                        if (int.TryParse(parts[1], out var sc))
+                        {
+                            scale = sc;
+                        }
+                    }
+
+                    dataType = typeName;
+                }
+            }
+
+            return (dataType, maxLength, precision, scale, nullable);
+        }
     }
 }
