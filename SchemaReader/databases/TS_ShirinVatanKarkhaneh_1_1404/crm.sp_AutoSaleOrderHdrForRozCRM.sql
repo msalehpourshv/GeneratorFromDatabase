@@ -1,0 +1,230 @@
+﻿USE TS_ShirinVatanKarkhaneh_1_1404
+GO
+SET ANSI_NULLS, QUOTED_IDENTIFIER ON
+GO
+-- =========== TS-QC:NOTOK ========================
+-- Author        : jafari
+-- Create date   : 1400/10/08
+-- Viewed By	 : 
+-- Last Modified : 
+-- Description   : ورود سفارش فروش  از crm  رز
+-- =============================================
+Create PROCEDURE crm.sp_AutoSaleOrderHdrForRozCRM
+@ProcessNo as int,
+@DocDate as CHAR(10),
+@StoreID AS VARCHAR(20),
+@AcntCode AS VARCHAR(20),
+@VisitorAcntCode AS VARCHAR(20),
+@DiscountPercent as FLOAT,
+@Discount as FLOAT,
+@Discount2 as FLOAT,
+@DocDesc as NVARCHAR(500),
+@SaleTypeID as VARCHAR(20),
+@TransportationIncome as float,
+@TransportationCost as float,
+@TaxOverWorthCost as FLOAT,
+@TollOverWorthCost as FLOAT,
+@TransferSerialNo as NVARCHAR(100),
+@DocStep as int
+WITH ENCRYPTION
+ AS
+
+BEGIN
+	DECLARE @maxSerialNo INT
+	DECLARE @SaleAcntCodeInSaleTypes BIT
+	DECLARE @DiscountAcntCode VARCHAR(20)
+	Declare @StrErrorMessage As Nvarchar(1024)
+	 
+	--DECLARE @AcntCustomerCode as Varchar(20)='3'
+	--DECLARE @PartXLen	Int;
+	--Declare @CustomerPartNo AS Tinyint
+	DECLARE @TransportationIncomeAcntCode as varchar(20)
+	DECLARE @TransportationCostAcntCode as varchar(20)
+	 
+BEGIN TRY
+
+if (select count(*) from sal.tblSaleOrderHdr where TransferSerialNo=@TransferSerialNo)=0
+begin	
+	
+	declare @FiscalYear				int;
+	set @FiscalYear=RIGHT (DB_NAME(),4) 
+	declare @PartNumber				int;
+	declare @PartStart				int;
+	declare @PartLen				int;
+	select @PartNumber=[acc].[FunGetAcntInfoForRemain](1)
+	select @PartStart=[acc].[FunGetAcntInfoForRemain](2)
+	select @PartLen=[acc].[FunGetAcntInfoForRemain](3)
+
+	declare @AcntCode1 AS VARCHAR(20)
+	declare @AcntCode2 AS VARCHAR(20)
+	declare @AcntCode3 AS VARCHAR(20)
+	declare @AcntCode4 AS VARCHAR(20)
+
+
+	IF @DocDate=''	
+		raiserror (N'  تاریخ صحیح نمی باشد', 16, 1)
+	IF @StoreID=''	
+		raiserror (N'کد انبار صحیح نمی باشد', 16, 1)
+	IF @AcntCode=''	
+		raiserror (N'کد مشتری صحیح نمی باشد', 16, 1)
+	if @PartNumber>=1
+	begin
+		SET @AcntCode1			    = LTrim(pub.funSplitString(@AcntCode, ' ', 1)); 
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode1 and PartNumber=1)=0
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری '+ @AcntCode1+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	
+		SET @AcntCode1			    = LTrim(pub.funSplitString(@VisitorAcntCode, ' ', 1)); 
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode1 and PartNumber=1)=0 and @AcntCode1<>''
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری ویزیتور  '+ @AcntCode1+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	
+	end 
+	if @PartNumber>=2
+	begin
+		SET @AcntCode2			    = LTrim(pub.funSplitString(@AcntCode, ' ', 2)); 	
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode2 and PartNumber=2)=0
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری '+ @AcntCode2+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	
+		SET @AcntCode2			    = LTrim(pub.funSplitString(@VisitorAcntCode, ' ', 2)); 	
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode2 and PartNumber=2)=0 and @AcntCode2<>''
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری ویزیتور '+ @AcntCode2+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	
+
+	end 
+	if @PartNumber>=3
+	begin
+		SET @AcntCode3			    = LTrim(pub.funSplitString(@AcntCode, ' ', 3));
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode3 and PartNumber=3)=0
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری '+ @AcntCode3+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	
+		SET @AcntCode3			    = LTrim(pub.funSplitString(@VisitorAcntCode, ' ', 3));
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode3 and PartNumber=3)=0 and @AcntCode3<>''
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری ویزیتور '+ @AcntCode3+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	  
+	end 
+	if @PartNumber>=4
+	begin
+		SET @AcntCode4			    = LTrim(pub.funSplitString(@AcntCode, ' ', 4)); 
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode4 and PartNumber=4)=0
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری '+ @AcntCode4+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	
+		SET @AcntCode4			    = LTrim(pub.funSplitString(@VisitorAcntCode, ' ', 4)); 
+		IF (SELECT COUNT(*) from acc.tblAcnt where AcntCode=@AcntCode4 and PartNumber=4)=0 and @AcntCode4<>''
+		BEGIN
+			Set @StrErrorMessage = N' کد حسابداری ویزیتور '+ @AcntCode4+' نامعتبر است'
+			raiserror (@StrErrorMessage, 16, 1)
+		END	 		
+	end 
+	 
+	--IF @SaleTypeID=''	
+	--	raiserror (N'کد نوع فروش صحیح نمی باشد', 16, 1)
+	IF @TransferSerialNo=0	
+		raiserror (N'کد سریال مبدا صحیح نمی باشد', 16, 1)
+	
+	IF (SELECT Count(*) FROM sal.tblSaleTypes where SaleTypeID=@SaleTypeID )=0 and @SaleTypeID<>''
+	BEGIN
+			Set @StrErrorMessage = N' کد نوع فروش  '+@SaleTypeID+' نامعتبر است '
+			raiserror (@StrErrorMessage, 16, 1)
+	END	
+	IF (SELECT Count(*) FROM inv.tblStores		where StoreID=@StoreID )=0
+	BEGIN
+		Set @StrErrorMessage = N'کد انبار  '+@StoreID+' نامعتبر است '
+		raiserror (@StrErrorMessage, 16, 1)
+	END	
+	
+	if @DiscountPercent>100
+	BEGIN
+		Set @StrErrorMessage = N'درصد تخفیف نمی تواند بیش از 100 باشد  '
+		raiserror (@StrErrorMessage, 16, 1)
+	END	
+	if @Discount>0 and @DiscountPercent=0
+	BEGIN
+		Set @StrErrorMessage = N'لطفا برای تخفیف ورودی درصدش را مشخص کنید و یا از تخفیف 2 استفاده کنید '
+		raiserror (@StrErrorMessage, 16, 1)
+	END	
+	--------------------------------------------------------------------------------------------------------------
+	declare @db_0000 as varchar(300)= Substring(db_name(), 1, Len(db_name()) - 4) + '0000'
+	declare @UserID as int=0
+	declare @SessionNo as int=0
+
+	Select @UserID=SettingValue from pub.tblSettings where SettingKey ='UserExternalCRM'
+
+	IF isnull(@UserID,0)<=0
+	BEGIN
+		Set @StrErrorMessage = N'  کد کاربر تعریف شده در تنظیمات برای Crm  نا معتبر است'
+		raiserror (@StrErrorMessage, 16, 1)
+	END	
+	
+	Select cast(0 as int ) SessionID, cast(0 as int ) SessionNo into #tblSession
+	DECLARE @StrSelect				NVarChar(4000);
+	SET @StrSelect = '
+		insert into  #tblSession
+		 exec '+@db_0000+'.[pub].[SetSessionNo] ''SessionNo''	,''برای کاربر'' 	,     ''  CRM ''	,   '' ROZ ''	,'+str(@UserID)+''
+
+	print @StrSelect
+	EXEC sp_executesql @StrSelect;
+	if (Select count(*) from   #tblSession )<=0
+	BEGIN
+		Set @StrErrorMessage = N' مشکل در اختصاص ایجاد SessionNo برای کاربر '
+		raiserror (@StrErrorMessage, 16, 1)
+	END	
+	Select @SessionNo=SessionNo from   #tblSession
+	--------------------------------------------------------------------------------------------------------------
+
+	SELECT  @SaleAcntCodeInSaleTypes = SettingValue
+	FROM pub.tblSettings
+	WHERE SettingKey = 'SaleAcntCodeInSaleTypes'
+	
+    If @SaleAcntCodeInSaleTypes =1
+		SELECT @DiscountAcntCode =SaleDiscountAcntCode,@TransportationCostAcntCode=TransportationCostAcntCode,@TransportationIncomeAcntCode=TransportationIncomeAcntCode FROM sal.tblSaleTypes WHERE SaleTypeID <>'' AND SaleTypeID =@SaleTypeID
+    Else
+		SELECT @DiscountAcntCode =SaleDiscountAcntCode,@TransportationCostAcntCode=TransportationCostAcntCode,@TransportationIncomeAcntCode=TransportationIncomeAcntCode FROM inv.tblStores WHERE StoreID <>'' AND StoreID = @StoreID
+
+	SELECT @maxSerialNo = isnull(MAX(SerialNo),0)
+	FROM sal.tblSaleOrderHdr
+	WHERE ProcessID=180
+	  AND ProcessNo=@ProcessNo
+	  AND FiscalYear=@FiscalYear
+			 
+	SET @maxSerialNo = @maxSerialNo +1
+
+	INSERT INTO sal.tblSaleOrderHdr
+	(ProcessID, ProcessNo, FiscalYear, SerialNo, DocStep, DocDate,	StoreID, AcntCode,
+	 DiscountPercent, Discount, Discount2, DocDesc,SaleTypeID,
+	 TaxOverWorthCost, TollOverWorthCost,DocDate2,
+	 TransportationIncomeAcntCode,TransportationIncome,TransferSerialNo,VisitorAcntCode,TransportationCostAcntCode,TransportationCost,SessionNo)
+	
+	SELECT 180, @ProcessNo, @FiscalYear, @maxSerialNo,@DocStep, @DocDate, @StoreID, @AcntCode,
+		  @DiscountPercent,@Discount,@Discount2, @DocDesc,
+		  @SaleTypeID,@TaxOverWorthCost, @TollOverWorthCost,@DocDate DocDate2,
+		  @TransportationIncomeAcntCode,@TransportationIncome,@TransferSerialNo,@VisitorAcntCode,@TransportationCostAcntCode,@TransportationCost,@SessionNo
+   
+	SELECT @maxSerialNo SerialNo,@AcntCode AcntCode,@StoreID StoreID,@SaleTypeID SaleTypeID,0 IsExist
+End
+else
+	SELECT   SerialNo, AcntCode,StoreID,SaleTypeID,1 IsExist from sal.tblSaleOrderHdr where TransferSerialNo=@TransferSerialNo
+
+END TRY
+BEGIN CATCH
+
+
+	Set @StrErrorMessage = ERROR_MESSAGE() 
+	raiserror (@StrErrorMessage, 16, 1)
+
+END CATCH
+
+END	
+GO
