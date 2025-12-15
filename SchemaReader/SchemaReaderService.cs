@@ -1,4 +1,5 @@
 using System.Data;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.Json;
@@ -33,26 +34,64 @@ public sealed class SchemaReaderService : ISchemaReader
         var connectionBuilder = new SqlConnectionStringBuilder(connectionString);
         var cacheKey = BuildCacheKey(connectionBuilder);
 
-        var cached = await TryReadFromCacheAsync(cacheKey, cancellationToken).ConfigureAwait(false);
-        if (cached is not null)
+        var databaseName = string.IsNullOrWhiteSpace(connectionBuilder.InitialCatalog)
+            ? "<default>"
+            : connectionBuilder.InitialCatalog;
+
+        var dataSource = string.IsNullOrWhiteSpace(connectionBuilder.DataSource)
+            ? "<unknown>"
+            : connectionBuilder.DataSource;
+
+        _logger.LogInformation(
+            "Reading schema for database {Database} on {DataSource} with cache key {CacheKey}",
+            databaseName,
+            dataSource,
+            cacheKey);
+
+        var readStopwatch = Stopwatch.StartNew();
+
+        try
         {
-            return cached;
+            var cached = await TryReadFromCacheAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+            if (cached is not null)
+            {
+                _logger.LogInformation("Schema cache hit for {Database}; returning cached value", databaseName);
+                return cached;
+            }
+
+            _logger.LogInformation("Schema cache miss for {Database}; loading from database", databaseName);
+
+            await using var connection = new SqlConnection(connectionBuilder.ConnectionString);
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Opened connection to {Database} on {DataSource}", connection.Database, dataSource);
+
+            var loadStopwatch = Stopwatch.StartNew();
+            var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Loaded schema metadata from database in {Elapsed}", loadStopwatch.Elapsed);
+
+            var databaseDirectory = ResolveDatabaseDirectory(connection.Database);
+            if (databaseDirectory is not null)
+            {
+                schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.LogInformation("No local database folder found for {Database}; skipping file overrides", connection.Database);
+            }
+
+            await WriteToCacheAsync(cacheKey, schema, cancellationToken).ConfigureAwait(false);
+
+            return schema;
         }
-
-        await using var connection = new SqlConnection(connectionBuilder.ConnectionString);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-        var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
-
-        var databaseDirectory = ResolveDatabaseDirectory(connection.Database);
-        if (databaseDirectory is not null)
+        catch (Exception ex)
         {
-            schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
+            _logger.LogError(ex, "Failed to read schema for {Database} on {DataSource}", databaseName, dataSource);
+            throw;
         }
-
-        await WriteToCacheAsync(cacheKey, schema, cancellationToken).ConfigureAwait(false);
-
-        return schema;
+        finally
+        {
+            _logger.LogInformation("Schema read completed for {Database} in {Elapsed}", databaseName, readStopwatch.Elapsed);
+        }
     }
 
     private static string BuildCacheKey(SqlConnectionStringBuilder builder)
@@ -75,9 +114,11 @@ public sealed class SchemaReaderService : ISchemaReader
             var cached = await _cache.GetStringAsync(cacheKey, cancellationToken).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(cached))
             {
+                _logger.LogDebug("No cached schema found for key {CacheKey}", cacheKey);
                 return null;
             }
 
+            _logger.LogDebug("Cached schema retrieved for key {CacheKey}", cacheKey);
             return JsonSerializer.Deserialize<DatabaseSchema>(cached, SerializerOptions);
         }
         catch (Exception ex)
@@ -98,6 +139,7 @@ public sealed class SchemaReaderService : ISchemaReader
             };
 
             await _cache.SetStringAsync(cacheKey, serialized, options, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Cached schema under key {CacheKey}", cacheKey);
         }
         catch (Exception ex)
         {
@@ -616,7 +658,7 @@ public sealed class SchemaReaderService : ISchemaReader
         return Directory.Exists(folder) ? folder : null;
     }
 
-    private static async Task<DatabaseSchema> ApplyDatabaseFilesAsync(DatabaseSchema schema, string databaseDirectory, CancellationToken cancellationToken)
+    private async Task<DatabaseSchema> ApplyDatabaseFilesAsync(DatabaseSchema schema, string databaseDirectory, CancellationToken cancellationToken)
     {
         var definitions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in Directory.EnumerateFiles(databaseDirectory, "*.sql", SearchOption.TopDirectoryOnly))
@@ -625,6 +667,12 @@ public sealed class SchemaReaderService : ISchemaReader
             var content = await File.ReadAllTextAsync(file, cancellationToken).ConfigureAwait(false);
             definitions[name] = content;
         }
+
+        _logger.LogInformation(
+            "Applying {Count} local definition files from {Directory} to schema for {Database}",
+            definitions.Count,
+            databaseDirectory,
+            schema.Connection);
 
         var schemas = schema.Schemas
             .Select(s => UpdateSchemaFromFiles(s, definitions))
