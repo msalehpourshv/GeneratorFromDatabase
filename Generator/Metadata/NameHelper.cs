@@ -7,6 +7,8 @@ internal static partial class NameHelper
 {
     private static readonly Regex Separator = GetSeparatorRegex();
 
+    private static readonly Regex NonEnglishRegex = GetNonEnglishRegex();
+
     public static string ToPascalCase(string rawName)
     {
         if (string.IsNullOrWhiteSpace(rawName))
@@ -38,6 +40,14 @@ internal static partial class NameHelper
         return char.IsLetter(candidate[0]) ? candidate : $"T{candidate}";
     }
 
+    public static bool ContainsNonEnglishLetters(string rawName)
+    {
+        return NonEnglishRegex.IsMatch(rawName);
+    }
+
     [GeneratedRegex("[^a-zA-Z0-9]+")]
     private static partial Regex GetSeparatorRegex();
+
+    [GeneratedRegex("[^\\p{IsBasicLatin}]")]
+    private static partial Regex GetNonEnglishRegex();
 }

@@ -63,6 +63,11 @@ internal sealed class TemplateMetadataBuilder
         var nameCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var column in table.Columns)
         {
+            if (NameHelper.ContainsNonEnglishLetters(column.Name))
+            {
+                continue;
+            }
+
             var (typeName, isReferenceType) = ColumnTypeMapper.MapToClrType(column);
             var nullableType = column.IsNullable && !string.Equals(typeName, "string", StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(typeName, "byte[]", StringComparison.OrdinalIgnoreCase)
