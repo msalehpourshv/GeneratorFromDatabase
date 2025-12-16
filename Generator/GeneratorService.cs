@@ -1,24 +1,19 @@
-using SchemaReader;
+using System.Net.Http;
 
 namespace Generator;
 
 public sealed class GeneratorService
 {
-    private readonly ISchemaReader _schemaReader;
 
-    public GeneratorService(ISchemaReader schemaReader)
+    public GeneratorService()
     {
-        _schemaReader = schemaReader;
     }
 
-    public async Task<GeneratorResult> ExecuteAsync(string connectionString, string outputDirectory, CancellationToken cancellationToken = default)
+    public async Task<GeneratorResult> ExecuteGenAsync()
     {
-        var schema = await _schemaReader.ReadSchemaAsync(connectionString, cancellationToken).ConfigureAwait(false);
-
         return new GeneratorResult
         {
-            Status = "Completed",
-            Schema = schema
+            Status = "Completed"
         };
     }
 }
