@@ -31,7 +31,7 @@ public sealed class GeneratorService
         }
 
         var metadataBuilder = new TemplateMetadataBuilder();
-        var metadata = metadataBuilder.Build(snapshot.Schema, _options.CustomLibraryName);
+        var metadata = metadataBuilder.Build(snapshot.Schema, _options.CustomLibraryName, _options.ExcludedTables);
 
         var outputDirectory = Path.Combine(solutionRoot, _options.OutputDirectoryName);
         Directory.CreateDirectory(outputDirectory);
@@ -40,7 +40,7 @@ public sealed class GeneratorService
         await metadataBuilder.WriteMetadataAsync(metadata, metadataPath, cancellationToken).ConfigureAwait(false);
         _logger.LogInformation("Metadata written to {MetadataPath}", metadataPath);
 
-        var projectRoot = Path.Combine(solutionRoot, _options.CustomLibraryName);
+        var projectRoot = ResolveProjectRoot(solutionRoot, _options.CustomLibraryPath, _options.CustomLibraryName);
         var renderer = new TemplateRenderer(_options.CustomLibraryName);
         await renderer.RenderAsync(metadata, projectRoot, cancellationToken).ConfigureAwait(false);
 
@@ -64,6 +64,18 @@ public sealed class GeneratorService
         }
 
         return Path.Combine(solutionRoot, configuredPath);
+    }
+
+    private static string ResolveProjectRoot(string solutionRoot, string? configuredPath, string libraryName)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return Path.IsPathRooted(configuredPath)
+                ? configuredPath
+                : Path.Combine(solutionRoot, configuredPath);
+        }
+
+        return Path.Combine(solutionRoot, libraryName);
     }
 
     private static async Task<SchemaSnapshot> LoadSchemaSnapshotAsync(string path, CancellationToken cancellationToken)

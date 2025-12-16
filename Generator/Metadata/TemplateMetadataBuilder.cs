@@ -5,9 +5,10 @@ namespace Generator.Metadata;
 
 internal sealed class TemplateMetadataBuilder
 {
-    public TemplateMetadata Build(DatabaseSchema schema, string projectName)
+    public TemplateMetadata Build(DatabaseSchema schema, string projectName, IReadOnlyCollection<string> excludedTables)
     {
         ArgumentNullException.ThrowIfNull(schema);
+        excludedTables ??= Array.Empty<string>();
 
         var entities = new List<EntityMetadata>();
 
@@ -15,6 +16,11 @@ internal sealed class TemplateMetadataBuilder
         {
             foreach (var table in schemaInfo.Tables)
             {
+                if (excludedTables.Contains(table.Name, StringComparer.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 var properties = BuildProperties(table);
                 var keyColumns = (table.PrimaryKey?.Columns ?? Array.Empty<string>())
                     .Select(name => properties.FirstOrDefault(p => string.Equals(p.ColumnName, name, StringComparison.OrdinalIgnoreCase)))

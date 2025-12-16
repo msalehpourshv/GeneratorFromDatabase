@@ -16,4 +16,15 @@ public sealed class GeneratorOptions
     /// The name of the generated class library that will hold the scaffolded code.
     /// </summary>
     public string CustomLibraryName { get; init; } = "CustomGeneratedLibrary";
+
+    /// <summary>
+    /// The relative or absolute path where the generated class library should be created.
+    /// If relative, it is resolved against the solution root.
+    /// </summary>
+    public string? CustomLibraryPath { get; init; }
+
+    /// <summary>
+    /// Tables to exclude from generation. Matches by table name (case-insensitive).
+    /// </summary>
+    public IReadOnlyList<string> ExcludedTables { get; init; } = Array.Empty<string>();
 }
