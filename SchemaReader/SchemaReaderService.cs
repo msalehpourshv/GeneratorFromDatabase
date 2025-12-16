@@ -1,19 +1,278 @@
+using System.Collections.Concurrent;
 using System.Data;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
 
 namespace SchemaReader;
 
 public sealed class SchemaReaderService : ISchemaReader
 {
-    public async Task<DatabaseSchema> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default)
-    {
-        await using var connection = new SqlConnection(connectionString);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+    private const string CachePrefix = "schema";
+    private static readonly MemoryCache MemoryCache = new(new MemoryCacheOptions());
+    private static readonly ConcurrentDictionary<string, Lazy<Task<SchemaWithSignature>>> InflightLoads = new();
+    private static readonly string[] LoadSteps =
+    [
+        "Read schemas",
+        "Read columns",
+        "Read tables",
+        "Read views",
+        "Read stored procedures",
+        "Read functions"
+    ];
 
-        return await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.General)
+    {
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = false
+    };
+
+    private readonly IDistributedCache _cache;
+    private readonly ILogger<SchemaReaderService> _logger;
+
+    public SchemaReaderService(IDistributedCache cache, ILogger<SchemaReaderService> logger)
+    {
+        _cache = cache;
+        _logger = logger;
     }
 
-    private static async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    public async Task<DatabaseSchema> ReadSchemaAsync(string connectionString, CancellationToken cancellationToken = default)
+    {
+        var connectionBuilder = new SqlConnectionStringBuilder(connectionString);
+        var cacheKey = BuildCacheKey(connectionBuilder);
+
+        var databaseName = string.IsNullOrWhiteSpace(connectionBuilder.InitialCatalog)
+            ? "<default>"
+            : connectionBuilder.InitialCatalog;
+
+        var dataSource = string.IsNullOrWhiteSpace(connectionBuilder.DataSource)
+            ? "<unknown>"
+            : connectionBuilder.DataSource;
+
+        _logger.LogInformation(
+            "Reading schema for database {Database} on {DataSource} with cache key {CacheKey}",
+            databaseName,
+            dataSource,
+            cacheKey);
+
+        var readStopwatch = Stopwatch.StartNew();
+        var databaseDirectory = ResolveDatabaseDirectory(connectionBuilder.InitialCatalog);
+        var signature = ComputeDatabaseDirectorySignature(databaseDirectory);
+
+        try
+        {
+            var memoryCached = TryReadFromMemoryCache(cacheKey, signature);
+            if (memoryCached is not null)
+            {
+                _logger.LogInformation("Schema memory cache hit for {Database}; returning cached value", databaseName);
+                return memoryCached;
+            }
+
+            var cached = await TryReadFromCacheAsync(cacheKey, signature, cancellationToken).ConfigureAwait(false);
+            if (cached is not null)
+            {
+                _logger.LogInformation("Schema cache hit for {Database}; returning cached value", databaseName);
+                return cached;
+            }
+
+            _logger.LogInformation("Schema cache miss for {Database}; loading from database", databaseName);
+
+            var inflightKey = BuildMemoryCacheKey(cacheKey, signature);
+            var loader = InflightLoads.GetOrAdd(
+                inflightKey,
+                _ => new Lazy<Task<SchemaWithSignature>>(
+                    () => LoadAndCacheSchemaAsync(
+                        connectionBuilder,
+                        cacheKey,
+                        signature,
+                        databaseDirectory,
+                        dataSource,
+                        cancellationToken),
+                    LazyThreadSafetyMode.ExecutionAndPublication));
+
+            try
+            {
+                var loaded = await loader.Value.ConfigureAwait(false);
+                AddToMemoryCache(cacheKey, loaded.Signature, loaded.Schema);
+                return loaded.Schema;
+            }
+            finally
+            {
+                InflightLoads.TryRemove(inflightKey, out _);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to read schema for {Database} on {DataSource}", databaseName, dataSource);
+            throw;
+        }
+        finally
+        {
+            _logger.LogInformation("Schema read completed for {Database} in {Elapsed}", databaseName, readStopwatch.Elapsed);
+        }
+    }
+
+    private static string BuildCacheKey(SqlConnectionStringBuilder builder)
+    {
+        var dataSource = string.IsNullOrWhiteSpace(builder.DataSource)
+            ? "unknown"
+            : builder.DataSource.Replace(':', '_').Replace('\\', '_').Replace('/', '_');
+
+        var database = string.IsNullOrWhiteSpace(builder.InitialCatalog)
+            ? "default"
+            : builder.InitialCatalog;
+
+        return $"{CachePrefix}:{dataSource}:{database}";
+    }
+
+    private DatabaseSchema? TryReadFromMemoryCache(string cacheKey, string signature)
+    {
+        if (MemoryCache.TryGetValue(BuildMemoryCacheKey(cacheKey, signature), out DatabaseSchema? schema))
+        {
+            _logger.LogDebug("Memory cache hit for key {CacheKey} with signature {Signature}", cacheKey, signature);
+            return schema;
+        }
+
+        _logger.LogDebug("No memory cache entry for key {CacheKey} with signature {Signature}", cacheKey, signature);
+        return null;
+    }
+
+    private async Task<DatabaseSchema?> TryReadFromCacheAsync(string cacheKey, string signature, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var cached = await _cache.GetStringAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(cached))
+            {
+                _logger.LogDebug("No cached schema found for key {CacheKey}", cacheKey);
+                return null;
+            }
+
+            try
+            {
+                var envelope = JsonSerializer.Deserialize<CachedSchemaEnvelope>(cached, SerializerOptions);
+                if (envelope is null)
+                {
+                    _logger.LogDebug("Cached schema could not be deserialized for key {CacheKey}", cacheKey);
+                    return TryPromoteLegacyCache(cached, cacheKey, signature);
+                }
+
+                if (!string.Equals(envelope.Signature, signature, StringComparison.Ordinal))
+                {
+                    _logger.LogInformation(
+                        "Cached schema signature mismatch for key {CacheKey}. Cached: {CachedSignature}, Current: {Signature}",
+                        cacheKey,
+                        envelope.Signature,
+                        signature);
+                    return null;
+                }
+
+                _logger.LogDebug("Cached schema retrieved for key {CacheKey} with signature {Signature}", cacheKey, signature);
+                AddToMemoryCache(cacheKey, signature, envelope.Schema);
+                return envelope.Schema;
+            }
+            catch (JsonException)
+            {
+                return TryPromoteLegacyCache(cached, cacheKey, signature);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to read schema cache for key {CacheKey}", cacheKey);
+            return null;
+        }
+    }
+
+    private async Task WriteToCacheAsync(string cacheKey, DatabaseSchema schema, string signature, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var serialized = JsonSerializer.Serialize(
+                new CachedSchemaEnvelope { Schema = schema, Signature = signature },
+                SerializerOptions);
+            var options = new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(12)
+            };
+
+            await _cache.SetStringAsync(cacheKey, serialized, options, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Cached schema under key {CacheKey}", cacheKey);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to write schema cache for key {CacheKey}", cacheKey);
+        }
+    }
+
+    private static string BuildMemoryCacheKey(string cacheKey, string signature) => $"{cacheKey}|{signature}";
+
+    private static void AddToMemoryCache(string cacheKey, string signature, DatabaseSchema schema)
+    {
+        MemoryCache.Set(BuildMemoryCacheKey(cacheKey, signature), schema, TimeSpan.FromHours(6));
+    }
+
+    private async Task<SchemaWithSignature> LoadAndCacheSchemaAsync(
+        SqlConnectionStringBuilder connectionBuilder,
+        string cacheKey,
+        string signature,
+        string? databaseDirectory,
+        string dataSource,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(connectionBuilder.ConnectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Opened connection to {Database} on {DataSource}", connection.Database, dataSource);
+
+        var loadStopwatch = Stopwatch.StartNew();
+        var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Loaded schema metadata from database in {Elapsed}", loadStopwatch.Elapsed);
+
+        if (databaseDirectory is not null)
+        {
+            schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            _logger.LogInformation("No local database folder found for {Database}; skipping file overrides", connection.Database);
+        }
+
+        await WriteToCacheAsync(cacheKey, schema, signature, cancellationToken).ConfigureAwait(false);
+
+        return new SchemaWithSignature(schema, signature);
+    }
+
+    private static string ComputeDatabaseDirectorySignature(string? databaseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(databaseDirectory) || !Directory.Exists(databaseDirectory))
+        {
+            return "none";
+        }
+
+        var builder = new StringBuilder();
+        foreach (var file in Directory.EnumerateFiles(databaseDirectory, "*.sql", SearchOption.TopDirectoryOnly).OrderBy(f => f))
+        {
+            var info = new FileInfo(file);
+            builder.Append(info.Name)
+                .Append('|')
+                .Append(info.Length)
+                .Append('|')
+                .Append(info.LastWriteTimeUtc.Ticks)
+                .Append(';');
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(builder.ToString());
+        var hash = SHA256.HashData(bytes);
+        return Convert.ToHexString(hash);
+    }
+
+    private async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
         var schemas = await LoadSchemasAsync(connection, cancellationToken).ConfigureAwait(false);
         return new DatabaseSchema
@@ -23,17 +282,26 @@ public sealed class SchemaReaderService : ISchemaReader
         };
     }
 
-    private static async Task<IReadOnlyList<SchemaInfo>> LoadSchemasAsync(SqlConnection connection, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<SchemaInfo>> LoadSchemasAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
         const string schemaSql = "SELECT schema_id, name FROM sys.schemas WHERE schema_id < 16384 ORDER BY name";
         var schemaNames = await ReadSchemasAsync(connection, schemaSql, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 1);
 
         var columns = await LoadColumnsAsync(connection, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 2);
 
         var tableLookup = await LoadTablesAsync(connection, columns, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 3);
+
         var viewLookup = await LoadViewsAsync(connection, columns, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 4);
+
         var storedProcedures = await LoadStoredProceduresAsync(connection, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 5);
+
         var functions = await LoadFunctionsAsync(connection, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 6);
 
         return schemaNames
             .Select(schema => new SchemaInfo
@@ -131,6 +399,32 @@ public sealed class SchemaReaderService : ISchemaReader
         }
 
         return lookup.ToDictionary(kvp => kvp.Key, kvp => (IReadOnlyList<ColumnInfo>)kvp.Value.ToArray());
+    }
+
+    private DatabaseSchema? TryPromoteLegacyCache(string cached, string cacheKey, string signature)
+    {
+        try
+        {
+            var legacy = JsonSerializer.Deserialize<DatabaseSchema>(cached, SerializerOptions);
+            if (legacy is null)
+            {
+                _logger.LogInformation("Legacy cache entry for {CacheKey} could not be read; ignoring", cacheKey);
+                return null;
+            }
+
+            _logger.LogInformation("Promoting legacy cached schema for {CacheKey} to signed envelope", cacheKey);
+            AddToMemoryCache(cacheKey, signature, legacy);
+
+            // Fire and forget upgrade; callers already received the schema from memory.
+            _ = WriteToCacheAsync(cacheKey, legacy, signature, CancellationToken.None);
+
+            return legacy;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogInformation(ex, "Legacy cache entry for {CacheKey} is invalid; ignoring", cacheKey);
+            return null;
+        }
     }
 
     private static async Task<Dictionary<int, PrimaryKeyInfo>> LoadPrimaryKeysAsync(SqlConnection connection, CancellationToken cancellationToken)
@@ -511,5 +805,411 @@ public sealed class SchemaReaderService : ISchemaReader
         {
             CommandTimeout = 60
         };
+    }
+
+    private static string? ResolveDatabaseDirectory(string databaseName)
+    {
+        if (string.IsNullOrWhiteSpace(databaseName))
+        {
+            return null;
+        }
+
+        var folder = Path.Combine(AppContext.BaseDirectory, "databases", databaseName);
+        return Directory.Exists(folder) ? folder : null;
+    }
+
+    private async Task<DatabaseSchema> ApplyDatabaseFilesAsync(DatabaseSchema schema, string databaseDirectory, CancellationToken cancellationToken)
+    {
+        var definitions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.EnumerateFiles(databaseDirectory, "*.sql", SearchOption.TopDirectoryOnly))
+        {
+            var name = Path.GetFileNameWithoutExtension(file);
+            var content = await File.ReadAllTextAsync(file, cancellationToken).ConfigureAwait(false);
+            definitions[name] = content;
+        }
+
+        _logger.LogInformation(
+            "Applying {Count} local definition files from {Directory} to schema for {Database}",
+            definitions.Count,
+            databaseDirectory,
+            schema.Connection);
+
+        var schemas = schema.Schemas
+            .Select(s => UpdateSchemaFromFiles(s, definitions))
+            .ToArray();
+
+        return new DatabaseSchema
+        {
+            Connection = schema.Connection,
+            Schemas = schemas
+        };
+    }
+
+    private static SchemaInfo UpdateSchemaFromFiles(SchemaInfo schema, IReadOnlyDictionary<string, string> definitions)
+    {
+        var views = schema.Views
+            .Select(v => UpdateView(v, schema.Name, definitions))
+            .ToArray();
+
+        var storedProcedures = schema.StoredProcedures
+            .Select(p => UpdateStoredProcedure(p, schema.Name, definitions))
+            .ToArray();
+
+        var functions = schema.Functions
+            .Select(f => UpdateFunction(f, schema.Name, definitions))
+            .ToArray();
+
+        return new SchemaInfo
+        {
+            Name = schema.Name,
+            Tables = schema.Tables,
+            Views = views,
+            StoredProcedures = storedProcedures,
+            Functions = functions
+        };
+    }
+
+    private static ViewInfo UpdateView(ViewInfo view, string schemaName, IReadOnlyDictionary<string, string> definitions)
+    {
+        var key = $"{schemaName}.{view.Name}";
+        if (!definitions.TryGetValue(key, out var definition))
+        {
+            return view;
+        }
+
+        return new ViewInfo
+        {
+            Name = view.Name,
+            Definition = definition,
+            Columns = view.Columns
+        };
+    }
+
+    private static StoredProcedureInfo UpdateStoredProcedure(StoredProcedureInfo procedure, string schemaName, IReadOnlyDictionary<string, string> definitions)
+    {
+        var key = $"{schemaName}.{procedure.Name}";
+        if (!definitions.TryGetValue(key, out var definition))
+        {
+            return procedure;
+        }
+
+        var parameters = ParseParameters(definition, procedure.Parameters, isFunction: false);
+
+        return new StoredProcedureInfo
+        {
+            Name = procedure.Name,
+            Definition = definition,
+            Parameters = parameters
+        };
+    }
+
+    private static FunctionInfo UpdateFunction(FunctionInfo function, string schemaName, IReadOnlyDictionary<string, string> definitions)
+    {
+        var key = $"{schemaName}.{function.Name}";
+        if (!definitions.TryGetValue(key, out var definition))
+        {
+            return function;
+        }
+
+        var parameters = ParseParameters(definition, function.Parameters, isFunction: true);
+
+        return new FunctionInfo
+        {
+            Name = function.Name,
+            Definition = definition,
+            ReturnType = function.ReturnType,
+            Parameters = parameters
+        };
+    }
+
+    private static IReadOnlyList<ParameterInfo> ParseParameters(string definition, IReadOnlyList<ParameterInfo> existingParameters, bool isFunction)
+    {
+        var parsed = ParameterParser.Parse(definition, isFunction);
+        if (parsed.Count == 0)
+        {
+            return existingParameters;
+        }
+
+        var existingLookup = existingParameters.ToDictionary(p => NormalizeParameterName(p.Name), p => p, StringComparer.OrdinalIgnoreCase);
+
+        var merged = new List<ParameterInfo>();
+        foreach (var param in parsed)
+        {
+            existingLookup.TryGetValue(NormalizeParameterName(param.Name), out var existing);
+            merged.Add(param.Merge(existing));
+        }
+
+        return merged;
+    }
+
+    private static string NormalizeParameterName(string name)
+    {
+        var normalized = name.Trim();
+        if (normalized.StartsWith("@", StringComparison.Ordinal))
+        {
+            normalized = normalized[1..];
+        }
+
+        return normalized.Trim('[', ']');
+    }
+
+    private sealed record ParsedParameter(
+        string Name,
+        string? DataType,
+        bool? IsOutput,
+        bool? IsNullable,
+        int? MaxLength,
+        byte? Precision,
+        int? Scale,
+        string? DefaultValue)
+    {
+        public ParameterInfo Merge(ParameterInfo? existing)
+        {
+            return new ParameterInfo
+            {
+                Name = FormatName(Name),
+                DataType = DataType ?? existing?.DataType ?? string.Empty,
+                IsOutput = IsOutput ?? existing?.IsOutput ?? false,
+                IsNullable = IsNullable ?? existing?.IsNullable ?? false,
+                MaxLength = MaxLength ?? existing?.MaxLength,
+                Precision = Precision ?? existing?.Precision,
+                Scale = Scale ?? existing?.Scale,
+                DefaultValue = DefaultValue ?? existing?.DefaultValue
+            };
+        }
+
+        private static string FormatName(string name)
+        {
+            var formatted = name.Trim();
+            if (!formatted.StartsWith("@", StringComparison.Ordinal))
+            {
+                formatted = "@" + formatted;
+            }
+
+            return formatted.Trim('[', ']');
+        }
+    }
+
+    private static class ParameterParser
+    {
+        public static List<ParsedParameter> Parse(string definition, bool isFunction)
+        {
+            var header = isFunction
+                ? ExtractFunctionHeader(definition)
+                : ExtractProcedureHeader(definition);
+
+            if (header is null)
+            {
+                return [];
+            }
+
+            var parametersText = CleanupHeader(header);
+            var segments = SplitParameters(parametersText);
+
+            return segments
+                .Select(ParseSegment)
+                .Where(p => p is not null)
+                .Select(p => p!)
+                .ToList();
+        }
+
+        private static string? ExtractProcedureHeader(string definition)
+        {
+            var match = Regex.Match(definition, "(?is)\\b(?:create|alter)\\s+proc(?:edure)?\\s+[\\w\\.\\[\\]]+\\s*(?<params>.*?)(?=^\\s*as\\b)", RegexOptions.Multiline);
+            return match.Success ? match.Groups["params"].Value : null;
+        }
+
+        private static string? ExtractFunctionHeader(string definition)
+        {
+            var match = Regex.Match(definition, "(?is)\\b(?:create|alter)\\s+function\\s+[\\w\\.\\[\\]]+\\s*(?<params>\\(.*?\\))\\s*(?=returns)");
+            return match.Success ? match.Groups["params"].Value : null;
+        }
+
+        private static string CleanupHeader(string header)
+        {
+            var cleaned = header.Trim();
+            if (cleaned.StartsWith("(") && cleaned.EndsWith(")"))
+            {
+                cleaned = cleaned[1..^1];
+            }
+
+            return cleaned;
+        }
+
+        private static List<string> SplitParameters(string header)
+        {
+            var parameters = new List<string>();
+            var builder = new StringBuilder();
+            var depth = 0;
+
+            foreach (var ch in header)
+            {
+                if (ch == '(')
+                {
+                    depth++;
+                }
+                else if (ch == ')')
+                {
+                    depth = Math.Max(0, depth - 1);
+                }
+
+                if (ch == ',' && depth == 0)
+                {
+                    parameters.Add(builder.ToString());
+                    builder.Clear();
+                    continue;
+                }
+
+                builder.Append(ch);
+            }
+
+            if (builder.Length > 0)
+            {
+                parameters.Add(builder.ToString());
+            }
+
+            return parameters
+                .Select(p => p.Trim())
+                .Where(p => !string.IsNullOrWhiteSpace(p))
+                .ToList();
+        }
+
+        private static ParsedParameter? ParseSegment(string segment)
+        {
+            var trimmed = segment.Trim();
+            if (!trimmed.Contains('@'))
+            {
+                return null;
+            }
+
+            var isOutput = Regex.IsMatch(trimmed, "\\b(out|output)\\b", RegexOptions.IgnoreCase);
+
+            var defaultIndex = FindAssignmentIndex(trimmed);
+            string? defaultValue = null;
+            if (defaultIndex >= 0)
+            {
+                defaultValue = trimmed[(defaultIndex + 1)..].Trim();
+                defaultValue = Regex.Replace(defaultValue, "\\b(out|output)\\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+            }
+
+            var withoutDefault = defaultIndex >= 0 ? trimmed[..defaultIndex] : trimmed;
+            var withoutOutput = Regex.Replace(withoutDefault, "\\b(out|output)\\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+
+            var nameEnd = withoutOutput.IndexOfAny([' ', '\t', '\r', '\n']);
+            var name = nameEnd >= 0 ? withoutOutput[..nameEnd] : withoutOutput;
+            var typeAndModifiers = nameEnd >= 0 ? withoutOutput[nameEnd..].Trim() : string.Empty;
+
+            var (dataType, maxLength, precision, scale, isNullable) = ParseType(typeAndModifiers, defaultValue);
+
+            return new ParsedParameter(name, dataType, isOutput, isNullable, maxLength, precision, scale, defaultValue);
+        }
+
+        private static int FindAssignmentIndex(string segment)
+        {
+            var depth = 0;
+            for (var i = 0; i < segment.Length; i++)
+            {
+                var ch = segment[i];
+                if (ch == '(')
+                {
+                    depth++;
+                }
+                else if (ch == ')')
+                {
+                    depth = Math.Max(0, depth - 1);
+                }
+                else if (ch == '=' && depth == 0)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static (string? DataType, int? MaxLength, byte? Precision, int? Scale, bool? IsNullable) ParseType(string typeAndModifiers, string? defaultValue)
+        {
+            if (string.IsNullOrWhiteSpace(typeAndModifiers))
+            {
+                return (null, null, null, null, null);
+            }
+
+            var nullable = default(bool?);
+            if (Regex.IsMatch(typeAndModifiers, "\\bNOT\\s+NULL\\b", RegexOptions.IgnoreCase))
+            {
+                nullable = false;
+            }
+            else if (Regex.IsMatch(typeAndModifiers, "\\bNULL\\b", RegexOptions.IgnoreCase) || string.Equals(defaultValue, "NULL", StringComparison.OrdinalIgnoreCase))
+            {
+                nullable = true;
+            }
+
+            var cleanedType = Regex.Replace(typeAndModifiers, "\\bNOT\\s+NULL\\b|\\bNULL\\b|\\bREADONLY\\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+
+            int? maxLength = null;
+            byte? precision = null;
+            int? scale = null;
+            string? dataType = cleanedType;
+
+            var openParenIndex = cleanedType.IndexOf('(');
+            if (openParenIndex >= 0)
+            {
+                var closeParenIndex = cleanedType.IndexOf(')', openParenIndex + 1);
+                if (closeParenIndex > openParenIndex)
+                {
+                    var typeName = cleanedType[..openParenIndex].Trim();
+                    var inner = cleanedType[(openParenIndex + 1)..closeParenIndex];
+                    var parts = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length == 1)
+                    {
+                        if (int.TryParse(parts[0], out var len))
+                        {
+                            maxLength = len;
+                        }
+                    }
+                    else if (parts.Length >= 2)
+                    {
+                        if (byte.TryParse(parts[0], out var prec))
+                        {
+                            precision = prec;
+                        }
+
+                        if (int.TryParse(parts[1], out var sc))
+                        {
+                            scale = sc;
+                        }
+                    }
+
+                    dataType = typeName;
+                }
+            }
+
+            return (dataType, maxLength, precision, scale, nullable);
+        }
+    }
+
+    private sealed record SchemaWithSignature(DatabaseSchema Schema, string Signature);
+
+    private sealed class CachedSchemaEnvelope
+    {
+        public required DatabaseSchema Schema { get; init; }
+
+        public required string Signature { get; init; }
+    }
+
+    private void LogProgress(SqlConnection connection, int stepIndex)
+    {
+        var total = LoadSteps.Length;
+        var name = stepIndex > 0 && stepIndex <= total ? LoadSteps[stepIndex - 1] : $"Step {stepIndex}";
+        var percent = (int)Math.Round(stepIndex / (double)total * 100, MidpointRounding.AwayFromZero);
+
+        _logger.LogInformation(
+            "Schema load progress for {Database}: step {Step}/{Total} ({Percent}%) - {Name}",
+            connection.Database,
+            stepIndex,
+            total,
+            percent,
+            name);
     }
 }

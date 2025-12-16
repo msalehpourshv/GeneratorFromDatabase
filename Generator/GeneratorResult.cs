@@ -5,6 +5,4 @@ namespace Generator;
 public sealed class GeneratorResult
 {
     public string Status { get; init; } = "Pending";
-
-    public DatabaseSchema Schema { get; init; } = new();
 }
