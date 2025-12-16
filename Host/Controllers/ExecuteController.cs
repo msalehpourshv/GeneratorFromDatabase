@@ -26,11 +26,10 @@ public sealed class ExecuteController : ControllerBase
         return Ok(result);
     }
 
-    public async Task<ActionResult<DatabaseSchema>> ExecuteReadSchema()
+    [HttpGet("schema")]
+    public async Task<ActionResult<DatabaseSchema>> ExecuteReadSchema(CancellationToken cancellationToken)
     {
         string conn = _config.GetConnectionString("DefaultConnection") ?? "";
-        string output = Path.Combine(Directory.GetCurrentDirectory(), "Generated");
-        CancellationToken cancellationToken = HttpContext.RequestAborted;
 
         DatabaseSchema schema = await _schemaReader.ReadSchemaAsync(conn, cancellationToken).ConfigureAwait(false);
 
