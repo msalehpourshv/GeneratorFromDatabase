@@ -19,7 +19,7 @@ public sealed class ExecuteController : ControllerBase
         _config = config;
     }
 
-    [HttpPost]
+    [HttpPost("generate")]
     public async Task<ActionResult<GeneratorResult>> ExecuteGen(CancellationToken cancellationToken)
     {
         var result = await _generator.ExecuteGenAsync(cancellationToken);
