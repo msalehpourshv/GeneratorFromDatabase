@@ -19,18 +19,17 @@ public sealed class ExecuteController : ControllerBase
         _config = config;
     }
 
-    [HttpPost]
-    public async Task<ActionResult<GeneratorResult>> ExecuteGen()
+    [HttpPost("generate")]
+    public async Task<ActionResult<GeneratorResult>> ExecuteGen(CancellationToken cancellationToken)
     {
-        var result = await _generator.ExecuteGenAsync();
+        var result = await _generator.ExecuteGenAsync(cancellationToken);
         return Ok(result);
     }
 
-    public async Task<ActionResult<DatabaseSchema>> ExecuteReadSchema()
+    [HttpGet("schema")]
+    public async Task<ActionResult<DatabaseSchema>> ExecuteReadSchema(CancellationToken cancellationToken)
     {
         string conn = _config.GetConnectionString("DefaultConnection") ?? "";
-        string output = Path.Combine(Directory.GetCurrentDirectory(), "Generated");
-        CancellationToken cancellationToken = HttpContext.RequestAborted;
 
         DatabaseSchema schema = await _schemaReader.ReadSchemaAsync(conn, cancellationToken).ConfigureAwait(false);
 
