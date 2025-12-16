@@ -11,6 +11,7 @@ builder.Services.AddStackExchangeRedisCache(options =>
     options.Configuration = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
     options.InstanceName = "schema:";
 });
+builder.Services.Configure<GeneratorOptions>(builder.Configuration.GetSection("Generator"));
 builder.Services.AddSingleton<ISchemaReader, SchemaReaderService>();
 builder.Services.AddTransient<GeneratorService>();
 

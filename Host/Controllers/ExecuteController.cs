@@ -20,9 +20,9 @@ public sealed class ExecuteController : ControllerBase
     }
 
     [HttpPost]
-    public async Task<ActionResult<GeneratorResult>> ExecuteGen()
+    public async Task<ActionResult<GeneratorResult>> ExecuteGen(CancellationToken cancellationToken)
     {
-        var result = await _generator.ExecuteGenAsync();
+        var result = await _generator.ExecuteGenAsync(cancellationToken);
         return Ok(result);
     }
 
