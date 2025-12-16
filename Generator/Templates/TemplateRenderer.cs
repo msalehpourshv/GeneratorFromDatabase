@@ -49,9 +49,9 @@ internal sealed class TemplateRenderer
                 <ImplicitUsings>enable</ImplicitUsings>
               </PropertyGroup>
               <ItemGroup>
-                <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.8" />
-                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.8" />
-                <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
+                <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
               </ItemGroup>
             </Project>
             """;
@@ -214,7 +214,7 @@ internal sealed class TemplateRenderer
                     Context = context;
                 }
 
-                protected DbConnection Connection => Context.Database.GetDbConnection();
+                protected DbConnection Connection => Context.Database.GetService<DbConnection>();
 
                 protected async Task<int> ExecuteAsync(string storedProcedureName, IEnumerable<DbParameter> parameters, CancellationToken cancellationToken = default)
                 {
@@ -405,6 +405,7 @@ internal sealed class TemplateRenderer
         var builder = new StringBuilder();
         builder.AppendLine($"using {_projectName}.Application.Dtos;");
         builder.AppendLine($"using {_projectName}.ApplicationShared.Models;");
+        builder.AppendLine($"using {_projectName}.Domain.Contracts.Repositories;");
         builder.AppendLine();
         builder.AppendLine($"namespace {_projectName}.Application.Contracts;");
         builder.AppendLine();

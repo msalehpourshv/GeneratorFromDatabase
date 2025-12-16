@@ -33,14 +33,14 @@ public sealed class GeneratorService
         var metadataBuilder = new TemplateMetadataBuilder();
         var metadata = metadataBuilder.Build(snapshot.Schema, _options.CustomLibraryName, _options.ExcludedTables);
 
-        var outputDirectory = Path.Combine(solutionRoot, _options.OutputDirectoryName);
+        var outputDirectory = Path.Combine(_options.CustomLibraryPath, _options.OutputDirectoryName);
         Directory.CreateDirectory(outputDirectory);
         var metadataPath = Path.Combine(outputDirectory, "template-metadata.json");
 
         await metadataBuilder.WriteMetadataAsync(metadata, metadataPath, cancellationToken).ConfigureAwait(false);
         _logger.LogInformation("Metadata written to {MetadataPath}", metadataPath);
 
-        var projectRoot = ResolveProjectRoot(solutionRoot, _options.CustomLibraryPath, _options.CustomLibraryName);
+        var projectRoot = Path.Combine(_options.CustomLibraryPath, _options.CustomLibraryName);
         var renderer = new TemplateRenderer(_options.CustomLibraryName);
         await renderer.RenderAsync(metadata, projectRoot, cancellationToken).ConfigureAwait(false);
 
