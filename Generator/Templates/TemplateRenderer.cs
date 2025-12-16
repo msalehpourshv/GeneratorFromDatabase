@@ -50,6 +50,7 @@ internal sealed class TemplateRenderer
               </PropertyGroup>
               <ItemGroup>
                 <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.8" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.8" />
                 <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
               </ItemGroup>
             </Project>
@@ -200,6 +201,7 @@ internal sealed class TemplateRenderer
             using System.Data;
             using System.Data.Common;
             using Microsoft.EntityFrameworkCore;
+            using Microsoft.EntityFrameworkCore.Infrastructure;
 
             namespace {{_projectName}}.StoredProcedure;
 
