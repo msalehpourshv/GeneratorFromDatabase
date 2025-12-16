@@ -18,6 +18,15 @@ public sealed class SchemaReaderService : ISchemaReader
     private const string CachePrefix = "schema";
     private static readonly MemoryCache MemoryCache = new(new MemoryCacheOptions());
     private static readonly ConcurrentDictionary<string, Lazy<Task<SchemaWithSignature>>> InflightLoads = new();
+    private static readonly string[] LoadSteps =
+    [
+        "Read schemas",
+        "Read columns",
+        "Read tables",
+        "Read views",
+        "Read stored procedures",
+        "Read functions"
+    ];
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.General)
     {
@@ -146,26 +155,33 @@ public sealed class SchemaReaderService : ISchemaReader
                 return null;
             }
 
-            var envelope = JsonSerializer.Deserialize<CachedSchemaEnvelope>(cached, SerializerOptions);
-            if (envelope is null)
+            try
             {
-                _logger.LogDebug("Cached schema could not be deserialized for key {CacheKey}", cacheKey);
-                return null;
-            }
+                var envelope = JsonSerializer.Deserialize<CachedSchemaEnvelope>(cached, SerializerOptions);
+                if (envelope is null)
+                {
+                    _logger.LogDebug("Cached schema could not be deserialized for key {CacheKey}", cacheKey);
+                    return TryPromoteLegacyCache(cached, cacheKey, signature);
+                }
 
-            if (!string.Equals(envelope.Signature, signature, StringComparison.Ordinal))
+                if (!string.Equals(envelope.Signature, signature, StringComparison.Ordinal))
+                {
+                    _logger.LogInformation(
+                        "Cached schema signature mismatch for key {CacheKey}. Cached: {CachedSignature}, Current: {Signature}",
+                        cacheKey,
+                        envelope.Signature,
+                        signature);
+                    return null;
+                }
+
+                _logger.LogDebug("Cached schema retrieved for key {CacheKey} with signature {Signature}", cacheKey, signature);
+                AddToMemoryCache(cacheKey, signature, envelope.Schema);
+                return envelope.Schema;
+            }
+            catch (JsonException)
             {
-                _logger.LogInformation(
-                    "Cached schema signature mismatch for key {CacheKey}. Cached: {CachedSignature}, Current: {Signature}",
-                    cacheKey,
-                    envelope.Signature,
-                    signature);
-                return null;
+                return TryPromoteLegacyCache(cached, cacheKey, signature);
             }
-
-            _logger.LogDebug("Cached schema retrieved for key {CacheKey} with signature {Signature}", cacheKey, signature);
-            AddToMemoryCache(cacheKey, signature, envelope.Schema);
-            return envelope.Schema;
         }
         catch (Exception ex)
         {
@@ -256,7 +272,7 @@ public sealed class SchemaReaderService : ISchemaReader
         return Convert.ToHexString(hash);
     }
 
-    private static async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    private async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
         var schemas = await LoadSchemasAsync(connection, cancellationToken).ConfigureAwait(false);
         return new DatabaseSchema
@@ -266,17 +282,26 @@ public sealed class SchemaReaderService : ISchemaReader
         };
     }
 
-    private static async Task<IReadOnlyList<SchemaInfo>> LoadSchemasAsync(SqlConnection connection, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<SchemaInfo>> LoadSchemasAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
         const string schemaSql = "SELECT schema_id, name FROM sys.schemas WHERE schema_id < 16384 ORDER BY name";
         var schemaNames = await ReadSchemasAsync(connection, schemaSql, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 1);
 
         var columns = await LoadColumnsAsync(connection, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 2);
 
         var tableLookup = await LoadTablesAsync(connection, columns, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 3);
+
         var viewLookup = await LoadViewsAsync(connection, columns, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 4);
+
         var storedProcedures = await LoadStoredProceduresAsync(connection, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 5);
+
         var functions = await LoadFunctionsAsync(connection, cancellationToken).ConfigureAwait(false);
+        LogProgress(connection, 6);
 
         return schemaNames
             .Select(schema => new SchemaInfo
@@ -374,6 +399,32 @@ public sealed class SchemaReaderService : ISchemaReader
         }
 
         return lookup.ToDictionary(kvp => kvp.Key, kvp => (IReadOnlyList<ColumnInfo>)kvp.Value.ToArray());
+    }
+
+    private DatabaseSchema? TryPromoteLegacyCache(string cached, string cacheKey, string signature)
+    {
+        try
+        {
+            var legacy = JsonSerializer.Deserialize<DatabaseSchema>(cached, SerializerOptions);
+            if (legacy is null)
+            {
+                _logger.LogInformation("Legacy cache entry for {CacheKey} could not be read; ignoring", cacheKey);
+                return null;
+            }
+
+            _logger.LogInformation("Promoting legacy cached schema for {CacheKey} to signed envelope", cacheKey);
+            AddToMemoryCache(cacheKey, signature, legacy);
+
+            // Fire and forget upgrade; callers already received the schema from memory.
+            _ = WriteToCacheAsync(cacheKey, legacy, signature, CancellationToken.None);
+
+            return legacy;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogInformation(ex, "Legacy cache entry for {CacheKey} is invalid; ignoring", cacheKey);
+            return null;
+        }
     }
 
     private static async Task<Dictionary<int, PrimaryKeyInfo>> LoadPrimaryKeysAsync(SqlConnection connection, CancellationToken cancellationToken)
@@ -1145,5 +1196,20 @@ public sealed class SchemaReaderService : ISchemaReader
         public required DatabaseSchema Schema { get; init; }
 
         public required string Signature { get; init; }
+    }
+
+    private void LogProgress(SqlConnection connection, int stepIndex)
+    {
+        var total = LoadSteps.Length;
+        var name = stepIndex > 0 && stepIndex <= total ? LoadSteps[stepIndex - 1] : $"Step {stepIndex}";
+        var percent = (int)Math.Round(stepIndex / (double)total * 100, MidpointRounding.AwayFromZero);
+
+        _logger.LogInformation(
+            "Schema load progress for {Database}: step {Step}/{Total} ({Percent}%) - {Name}",
+            connection.Database,
+            stepIndex,
+            total,
+            percent,
+            name);
     }
 }
