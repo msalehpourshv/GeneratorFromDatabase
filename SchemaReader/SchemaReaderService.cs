@@ -1,11 +1,14 @@
+using System.Collections.Concurrent;
 using System.Data;
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 
 namespace SchemaReader;
@@ -13,6 +16,8 @@ namespace SchemaReader;
 public sealed class SchemaReaderService : ISchemaReader
 {
     private const string CachePrefix = "schema";
+    private static readonly MemoryCache MemoryCache = new(new MemoryCacheOptions());
+    private static readonly ConcurrentDictionary<string, Lazy<Task<SchemaWithSignature>>> InflightLoads = new();
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.General)
     {
@@ -49,10 +54,19 @@ public sealed class SchemaReaderService : ISchemaReader
             cacheKey);
 
         var readStopwatch = Stopwatch.StartNew();
+        var databaseDirectory = ResolveDatabaseDirectory(connectionBuilder.InitialCatalog);
+        var signature = ComputeDatabaseDirectorySignature(databaseDirectory);
 
         try
         {
-            var cached = await TryReadFromCacheAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+            var memoryCached = TryReadFromMemoryCache(cacheKey, signature);
+            if (memoryCached is not null)
+            {
+                _logger.LogInformation("Schema memory cache hit for {Database}; returning cached value", databaseName);
+                return memoryCached;
+            }
+
+            var cached = await TryReadFromCacheAsync(cacheKey, signature, cancellationToken).ConfigureAwait(false);
             if (cached is not null)
             {
                 _logger.LogInformation("Schema cache hit for {Database}; returning cached value", databaseName);
@@ -61,27 +75,29 @@ public sealed class SchemaReaderService : ISchemaReader
 
             _logger.LogInformation("Schema cache miss for {Database}; loading from database", databaseName);
 
-            await using var connection = new SqlConnection(connectionBuilder.ConnectionString);
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Opened connection to {Database} on {DataSource}", connection.Database, dataSource);
+            var inflightKey = BuildMemoryCacheKey(cacheKey, signature);
+            var loader = InflightLoads.GetOrAdd(
+                inflightKey,
+                _ => new Lazy<Task<SchemaWithSignature>>(
+                    () => LoadAndCacheSchemaAsync(
+                        connectionBuilder,
+                        cacheKey,
+                        signature,
+                        databaseDirectory,
+                        dataSource,
+                        cancellationToken),
+                    LazyThreadSafetyMode.ExecutionAndPublication));
 
-            var loadStopwatch = Stopwatch.StartNew();
-            var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Loaded schema metadata from database in {Elapsed}", loadStopwatch.Elapsed);
-
-            var databaseDirectory = ResolveDatabaseDirectory(connection.Database);
-            if (databaseDirectory is not null)
+            try
             {
-                schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
+                var loaded = await loader.Value.ConfigureAwait(false);
+                AddToMemoryCache(cacheKey, loaded.Signature, loaded.Schema);
+                return loaded.Schema;
             }
-            else
+            finally
             {
-                _logger.LogInformation("No local database folder found for {Database}; skipping file overrides", connection.Database);
+                InflightLoads.TryRemove(inflightKey, out _);
             }
-
-            await WriteToCacheAsync(cacheKey, schema, cancellationToken).ConfigureAwait(false);
-
-            return schema;
         }
         catch (Exception ex)
         {
@@ -107,7 +123,19 @@ public sealed class SchemaReaderService : ISchemaReader
         return $"{CachePrefix}:{dataSource}:{database}";
     }
 
-    private async Task<DatabaseSchema?> TryReadFromCacheAsync(string cacheKey, CancellationToken cancellationToken)
+    private DatabaseSchema? TryReadFromMemoryCache(string cacheKey, string signature)
+    {
+        if (MemoryCache.TryGetValue(BuildMemoryCacheKey(cacheKey, signature), out DatabaseSchema? schema))
+        {
+            _logger.LogDebug("Memory cache hit for key {CacheKey} with signature {Signature}", cacheKey, signature);
+            return schema;
+        }
+
+        _logger.LogDebug("No memory cache entry for key {CacheKey} with signature {Signature}", cacheKey, signature);
+        return null;
+    }
+
+    private async Task<DatabaseSchema?> TryReadFromCacheAsync(string cacheKey, string signature, CancellationToken cancellationToken)
     {
         try
         {
@@ -118,8 +146,26 @@ public sealed class SchemaReaderService : ISchemaReader
                 return null;
             }
 
-            _logger.LogDebug("Cached schema retrieved for key {CacheKey}", cacheKey);
-            return JsonSerializer.Deserialize<DatabaseSchema>(cached, SerializerOptions);
+            var envelope = JsonSerializer.Deserialize<CachedSchemaEnvelope>(cached, SerializerOptions);
+            if (envelope is null)
+            {
+                _logger.LogDebug("Cached schema could not be deserialized for key {CacheKey}", cacheKey);
+                return null;
+            }
+
+            if (!string.Equals(envelope.Signature, signature, StringComparison.Ordinal))
+            {
+                _logger.LogInformation(
+                    "Cached schema signature mismatch for key {CacheKey}. Cached: {CachedSignature}, Current: {Signature}",
+                    cacheKey,
+                    envelope.Signature,
+                    signature);
+                return null;
+            }
+
+            _logger.LogDebug("Cached schema retrieved for key {CacheKey} with signature {Signature}", cacheKey, signature);
+            AddToMemoryCache(cacheKey, signature, envelope.Schema);
+            return envelope.Schema;
         }
         catch (Exception ex)
         {
@@ -128,11 +174,13 @@ public sealed class SchemaReaderService : ISchemaReader
         }
     }
 
-    private async Task WriteToCacheAsync(string cacheKey, DatabaseSchema schema, CancellationToken cancellationToken)
+    private async Task WriteToCacheAsync(string cacheKey, DatabaseSchema schema, string signature, CancellationToken cancellationToken)
     {
         try
         {
-            var serialized = JsonSerializer.Serialize(schema, SerializerOptions);
+            var serialized = JsonSerializer.Serialize(
+                new CachedSchemaEnvelope { Schema = schema, Signature = signature },
+                SerializerOptions);
             var options = new DistributedCacheEntryOptions
             {
                 AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(12)
@@ -145,6 +193,67 @@ public sealed class SchemaReaderService : ISchemaReader
         {
             _logger.LogWarning(ex, "Unable to write schema cache for key {CacheKey}", cacheKey);
         }
+    }
+
+    private static string BuildMemoryCacheKey(string cacheKey, string signature) => $"{cacheKey}|{signature}";
+
+    private static void AddToMemoryCache(string cacheKey, string signature, DatabaseSchema schema)
+    {
+        MemoryCache.Set(BuildMemoryCacheKey(cacheKey, signature), schema, TimeSpan.FromHours(6));
+    }
+
+    private async Task<SchemaWithSignature> LoadAndCacheSchemaAsync(
+        SqlConnectionStringBuilder connectionBuilder,
+        string cacheKey,
+        string signature,
+        string? databaseDirectory,
+        string dataSource,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(connectionBuilder.ConnectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Opened connection to {Database} on {DataSource}", connection.Database, dataSource);
+
+        var loadStopwatch = Stopwatch.StartNew();
+        var schema = await LoadDatabaseSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Loaded schema metadata from database in {Elapsed}", loadStopwatch.Elapsed);
+
+        if (databaseDirectory is not null)
+        {
+            schema = await ApplyDatabaseFilesAsync(schema, databaseDirectory, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            _logger.LogInformation("No local database folder found for {Database}; skipping file overrides", connection.Database);
+        }
+
+        await WriteToCacheAsync(cacheKey, schema, signature, cancellationToken).ConfigureAwait(false);
+
+        return new SchemaWithSignature(schema, signature);
+    }
+
+    private static string ComputeDatabaseDirectorySignature(string? databaseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(databaseDirectory) || !Directory.Exists(databaseDirectory))
+        {
+            return "none";
+        }
+
+        var builder = new StringBuilder();
+        foreach (var file in Directory.EnumerateFiles(databaseDirectory, "*.sql", SearchOption.TopDirectoryOnly).OrderBy(f => f))
+        {
+            var info = new FileInfo(file);
+            builder.Append(info.Name)
+                .Append('|')
+                .Append(info.Length)
+                .Append('|')
+                .Append(info.LastWriteTimeUtc.Ticks)
+                .Append(';');
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(builder.ToString());
+        var hash = SHA256.HashData(bytes);
+        return Convert.ToHexString(hash);
     }
 
     private static async Task<DatabaseSchema> LoadDatabaseSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
@@ -1027,5 +1136,14 @@ public sealed class SchemaReaderService : ISchemaReader
 
             return (dataType, maxLength, precision, scale, nullable);
         }
+    }
+
+    private sealed record SchemaWithSignature(DatabaseSchema Schema, string Signature);
+
+    private sealed class CachedSchemaEnvelope
+    {
+        public required DatabaseSchema Schema { get; init; }
+
+        public required string Signature { get; init; }
     }
 }
