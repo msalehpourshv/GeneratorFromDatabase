@@ -44,14 +44,14 @@ internal sealed class TemplateRenderer
         var content = $$"""
             <Project Sdk="Microsoft.NET.Sdk">
               <PropertyGroup>
-                <TargetFramework>net10.0</TargetFramework>
+                <TargetFramework>net6.0</TargetFramework>
                 <Nullable>enable</Nullable>
                 <ImplicitUsings>enable</ImplicitUsings>
               </PropertyGroup>
               <ItemGroup>
-                <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
-                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
-                <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore" Version="6.0.27" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="6.0.27" />
+                <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="6.0.0" />
               </ItemGroup>
             </Project>
             """;
@@ -115,7 +115,7 @@ internal sealed class TemplateRenderer
 
             public sealed class PagedResult<T>
             {
-                public required IReadOnlyList<T> Items { get; init; }
+                public IReadOnlyList<T> Items { get; init; } = Array.Empty<T>();
 
                 public int TotalCount { get; init; }
 
