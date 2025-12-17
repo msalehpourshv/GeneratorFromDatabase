@@ -219,7 +219,10 @@ internal sealed class TemplateRenderer
 
                 protected async Task<int> ExecuteAsync(string storedProcedureName, IEnumerable<DbParameter> parameters, CancellationToken cancellationToken = default)
                 {
-                    ArgumentException.ThrowIfNullOrWhiteSpace(storedProcedureName);
+                    if (string.IsNullOrWhiteSpace(storedProcedureName))
+                    {
+                        throw new ArgumentException("Stored procedure name must be provided.", nameof(storedProcedureName));
+                    }
 
                     await using var command = Connection.CreateCommand();
                     command.CommandType = CommandType.StoredProcedure;
