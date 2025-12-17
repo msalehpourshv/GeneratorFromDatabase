@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text;
 using Generator.Metadata;
 
@@ -310,11 +311,6 @@ internal sealed class TemplateRenderer
         builder.AppendLine();
         builder.AppendLine($"namespace {_projectName}.Domain.Entities;");
         builder.AppendLine();
-
-        if (entity.KeyProperties.Count > 1)
-        {
-            builder.AppendLine($"[PrimaryKey({string.Join(", ", entity.KeyProperties.Select(p => $"nameof({p.PropertyName})"))})]");
-        }
 
         builder.AppendLine($"[Table(\"{entity.TableName}\", Schema = \"{entity.SchemaName}\")]");
         builder.AppendLine($"public sealed class {entity.EntityName} : EntityBase");
@@ -660,6 +656,23 @@ internal sealed class TemplateRenderer
         foreach (var entity in metadata.Entities)
         {
             builder.AppendLine($"    public DbSet<{entity.EntityName}> {entity.EntityName}Set => Set<{entity.EntityName}>();");
+        }
+
+        var compositeKeyEntities = metadata.Entities.Where(e => e.KeyProperties.Count > 1).ToList();
+        if (compositeKeyEntities.Count > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine("    protected override void OnModelCreating(ModelBuilder modelBuilder)");
+            builder.AppendLine("    {");
+            builder.AppendLine("        base.OnModelCreating(modelBuilder);");
+            builder.AppendLine();
+
+            foreach (var entity in compositeKeyEntities)
+            {
+                builder.AppendLine($"        modelBuilder.Entity<{entity.EntityName}>().HasKey(e => new {{ {string.Join(", ", entity.KeyProperties.Select(p => $"e.{p.PropertyName}"))} }});");
+            }
+
+            builder.AppendLine("    }");
         }
 
         builder.AppendLine("}");
