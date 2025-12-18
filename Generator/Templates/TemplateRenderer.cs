@@ -1,6 +1,7 @@
 using System.Linq;
 using System.Text;
 using Generator.Metadata;
+using System;
 
 namespace Generator.Templates;
 
@@ -36,8 +37,9 @@ internal sealed class TemplateRenderer
             await WriteServiceInterfaceAsync(projectRoot, entity, cancellationToken).ConfigureAwait(false);
             await WriteServiceImplementationAsync(projectRoot, entity, cancellationToken).ConfigureAwait(false);
             await WriteEfRepositoryAsync(projectRoot, entity, cancellationToken).ConfigureAwait(false);
-            await WriteStoredProcedureRepositoryAsync(projectRoot, entity, cancellationToken).ConfigureAwait(false);
         }
+
+        await WriteStoredProcedureRepositoriesAsync(projectRoot, metadata, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task WriteProjectFileAsync(string projectRoot, CancellationToken cancellationToken)
@@ -636,12 +638,17 @@ internal sealed class TemplateRenderer
     private async Task WriteStoredProcedureBaseAsync(string projectRoot, CancellationToken cancellationToken)
     {
         var content = $$"""
+            using System;
+            using System.Collections.Generic;
             using System.Data;
             using System.Data.Common;
+            using Microsoft.Data.SqlClient;
             using Microsoft.EntityFrameworkCore;
             using Microsoft.EntityFrameworkCore.Infrastructure;
 
             namespace {{_projectName}}.StoredProcedure;
+
+            public sealed record StoredProcedureResult<TOutput>(int RowsAffected, TOutput Output);
 
             public abstract class StoredProcedureRepository
             {
@@ -676,6 +683,80 @@ internal sealed class TemplateRenderer
                     }
 
                     return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                protected static DbParameter CreateParameter(
+                    string name,
+                    object? value,
+                    SqlDbType sqlDbType,
+                    bool isOutput,
+                    bool isNullable,
+                    int? size,
+                    byte? precision,
+                    int? scale)
+                {
+                    var parameter = new SqlParameter(name, sqlDbType)
+                    {
+                        Direction = isOutput ? ParameterDirection.Output : ParameterDirection.Input,
+                        IsNullable = isNullable
+                    };
+
+                    if (!isOutput)
+                    {
+                        parameter.Value = value ?? DBNull.Value;
+                    }
+
+                    if (size.HasValue)
+                    {
+                        parameter.Size = size.Value;
+                    }
+
+                    if (precision.HasValue)
+                    {
+                        parameter.Precision = precision.Value;
+                    }
+
+                    if (scale.HasValue)
+                    {
+                        parameter.Scale = (byte)scale.Value;
+                    }
+
+                    return parameter;
+                }
+
+                protected static T? ConvertFromDbValue<T>(object? value)
+                {
+                    if (value is null || value == DBNull.Value)
+                    {
+                        return default;
+                    }
+
+                    return (T?)Convert.ChangeType(value, typeof(T));
+                }
+            }
+
+            public abstract class StoredProcedureRepositoryBase<TInput, TOutput> : StoredProcedureRepository
+                where TInput : class
+                where TOutput : class, new()
+            {
+                protected StoredProcedureRepositoryBase(DbContext context) : base(context)
+                {
+                }
+
+                protected abstract string StoredProcedureName { get; }
+
+                protected abstract IReadOnlyList<DbParameter> BuildParameters(TInput input);
+
+                protected abstract TOutput MapOutput(IReadOnlyList<DbParameter> parameters);
+
+                public async Task<StoredProcedureResult<TOutput>> ExecuteAsync(TInput input, CancellationToken cancellationToken = default)
+                {
+                    ArgumentNullException.ThrowIfNull(input);
+
+                    var parameters = BuildParameters(input);
+                    var rowsAffected = await base.ExecuteAsync(StoredProcedureName, parameters, cancellationToken).ConfigureAwait(false);
+                    var output = MapOutput(parameters);
+                    return new StoredProcedureResult<TOutput>(rowsAffected, output);
                 }
             }
             """;
@@ -716,7 +797,6 @@ internal sealed class TemplateRenderer
         builder.AppendLine($"using {_projectName}.DomainShared.Contracts;");
         builder.AppendLine($"using {_projectName}.EntityFramework.Data;");
         builder.AppendLine($"using {_projectName}.EntityFramework.Repositories;");
-        builder.AppendLine($"using {_projectName}.StoredProcedure.Repositories;");
         builder.AppendLine();
         builder.AppendLine($"namespace {_projectName}.EntityFramework;");
         builder.AppendLine();
@@ -730,7 +810,12 @@ internal sealed class TemplateRenderer
         foreach (var entity in metadata.Entities)
         {
             builder.AppendLine($"        services.AddScoped<I{entity.EntityName}Repository, {entity.EntityName}Repository>();");
-            builder.AppendLine($"        services.AddScoped<{entity.EntityName}StoredProcedureRepository>();");
+        }
+
+        foreach (var storedProcedure in metadata.StoredProcedures)
+        {
+            var className = NameHelper.ToPascalCase(storedProcedure.Name);
+            builder.AppendLine($"        services.AddScoped<{_projectName}.StoredProcedure.{className}.Repositories.{className}StoredProcedureRepository>();");
         }
 
         builder.AppendLine();
@@ -1141,28 +1226,130 @@ internal sealed class TemplateRenderer
         await WriteFileAsync(Path.Combine(projectRoot, "EntityFramework", "Repositories", $"{entity.EntityName}Repository.cs"), builder.ToString(), cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task WriteStoredProcedureRepositoryAsync(string projectRoot, EntityMetadata entity, CancellationToken cancellationToken)
+    private async Task WriteStoredProcedureRepositoriesAsync(string projectRoot, TemplateMetadata metadata, CancellationToken cancellationToken)
+    {
+        foreach (var storedProcedure in metadata.StoredProcedures)
+        {
+            var className = NameHelper.ToPascalCase(storedProcedure.Name);
+            var storedProcedureFolder = Path.Combine(projectRoot, "StoredProcedure", className);
+            var dtoFolder = Path.Combine(storedProcedureFolder, "Dtos");
+            var sqlFolder = Path.Combine(storedProcedureFolder, "Sql");
+            var repositoryFolder = Path.Combine(storedProcedureFolder, "Repositories");
+
+            Directory.CreateDirectory(dtoFolder);
+            Directory.CreateDirectory(sqlFolder);
+            Directory.CreateDirectory(repositoryFolder);
+
+            await WriteStoredProcedureDtosAsync(dtoFolder, className, storedProcedure, cancellationToken).ConfigureAwait(false);
+            await WriteStoredProcedureSqlAsync(sqlFolder, storedProcedure, cancellationToken).ConfigureAwait(false);
+            await WriteStoredProcedureRepositoryAsync(repositoryFolder, className, storedProcedure, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task WriteStoredProcedureDtosAsync(string dtoFolder, string className, StoredProcedureMetadata storedProcedure, CancellationToken cancellationToken)
+    {
+        var inputDto = BuildStoredProcedureDto(className, storedProcedure, isOutputDto: false);
+        var outputDto = BuildStoredProcedureDto(className, storedProcedure, isOutputDto: true);
+
+        await WriteFileAsync(Path.Combine(dtoFolder, $"{className}InputDto.cs"), inputDto, cancellationToken).ConfigureAwait(false);
+        await WriteFileAsync(Path.Combine(dtoFolder, $"{className}OutputDto.cs"), outputDto, cancellationToken).ConfigureAwait(false);
+    }
+
+    private string BuildStoredProcedureDto(string className, StoredProcedureMetadata storedProcedure, bool isOutputDto)
     {
         var builder = new StringBuilder();
+        builder.AppendLine($"namespace {_projectName}.StoredProcedure.{className}.Dtos;");
+        builder.AppendLine();
+        builder.AppendLine($"public sealed class {className}{(isOutputDto ? "Output" : "Input")}Dto");
+        builder.AppendLine("{");
+
+        var parameters = storedProcedure.Properties.Where(p => p.IsOutput == isOutputDto).ToList();
+        if (parameters.Count == 0)
+        {
+            builder.AppendLine("}");
+            return builder.ToString();
+        }
+
+        foreach (var parameter in parameters)
+        {
+            builder.AppendLine($"    public {parameter.ClrTypeName} {parameter.PropertyName} {{ get; set; }}");
+        }
+
+        builder.AppendLine("}");
+        return builder.ToString();
+    }
+
+    private async Task WriteStoredProcedureSqlAsync(string sqlFolder, StoredProcedureMetadata storedProcedure, CancellationToken cancellationToken)
+    {
+        var fileName = $"{storedProcedure.Name}.sql";
+        await File.WriteAllTextAsync(Path.Combine(sqlFolder, fileName), storedProcedure.Code, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task WriteStoredProcedureRepositoryAsync(string repositoryFolder, string className, StoredProcedureMetadata storedProcedure, CancellationToken cancellationToken)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("using System;");
+        builder.AppendLine("using System.Collections.Generic;");
+        builder.AppendLine("using System.Data;");
         builder.AppendLine("using System.Data.Common;");
+        builder.AppendLine("using System.Linq;");
+        builder.AppendLine("using Microsoft.Data.SqlClient;");
+        builder.AppendLine("using Microsoft.EntityFrameworkCore;");
         builder.AppendLine($"using {_projectName}.EntityFramework.Data;");
         builder.AppendLine($"using {_projectName}.StoredProcedure;");
+        builder.AppendLine($"using {_projectName}.StoredProcedure.{className}.Dtos;");
         builder.AppendLine();
-        builder.AppendLine($"namespace {_projectName}.StoredProcedure.Repositories;");
+        builder.AppendLine($"namespace {_projectName}.StoredProcedure.{className}.Repositories;");
         builder.AppendLine();
-        builder.AppendLine($"public sealed class {entity.EntityName}StoredProcedureRepository : StoredProcedureRepository");
+        builder.AppendLine($"public sealed class {className}StoredProcedureRepository : StoredProcedureRepositoryBase<{className}InputDto, {className}OutputDto>");
         builder.AppendLine("{");
-        builder.AppendLine($"    public {entity.EntityName}StoredProcedureRepository(AppDbContext context) : base(context)");
+        builder.AppendLine($"    private const string StoredProcedureFullName = \"{storedProcedure.SchemaName}.{storedProcedure.Name}\";");
+        builder.AppendLine();
+        builder.AppendLine($"    public {className}StoredProcedureRepository(AppDbContext context) : base(context)");
         builder.AppendLine("    {");
         builder.AppendLine("    }");
         builder.AppendLine();
-        builder.AppendLine("    public Task<int> ExecuteAsync(string storedProcedureName, IEnumerable<DbParameter> parameters, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    protected override string StoredProcedureName => StoredProcedureFullName;");
+        builder.AppendLine();
+        builder.AppendLine($"    protected override IReadOnlyList<DbParameter> BuildParameters({className}InputDto input)");
         builder.AppendLine("    {");
-        builder.AppendLine("        return base.ExecuteAsync(storedProcedureName, parameters, cancellationToken);");
+        builder.AppendLine("        var parameters = new List<DbParameter>();");
+
+        foreach (var parameter in storedProcedure.Properties)
+        {
+            var parameterName = GetParameterName(parameter.Name);
+            var sqlDbType = GetSqlDbType(parameter.SqlTypeName);
+            var inputValue = parameter.IsOutput ? "null" : $"input.{parameter.PropertyName}";
+            var sizeValue = parameter.MaxLength.HasValue ? parameter.MaxLength.Value.ToString() : "null";
+            var precisionValue = parameter.Precision.HasValue ? parameter.Precision.Value.ToString() : "null";
+            var scaleValue = parameter.Scale.HasValue ? parameter.Scale.Value.ToString() : "null";
+
+            builder.AppendLine($"        parameters.Add(CreateParameter(\"{parameterName}\", {inputValue}, {sqlDbType}, {parameter.IsOutput.ToString().ToLowerInvariant()}, {parameter.IsNullable.ToString().ToLowerInvariant()}, {sizeValue}, {precisionValue}, {scaleValue}));");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("        return parameters;");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+        builder.AppendLine($"    protected override {className}OutputDto MapOutput(IReadOnlyList<DbParameter> parameters)");
+        builder.AppendLine("    {");
+        builder.AppendLine($"        var output = new {className}OutputDto();");
+
+        var outputParameters = storedProcedure.Properties.Where(p => p.IsOutput).ToList();
+        foreach (var parameter in outputParameters)
+        {
+            var parameterName = GetParameterName(parameter.Name);
+            var clrType = parameter.ClrTypeNameWithoutNullability;
+            builder.AppendLine($"        var {parameter.PropertyName}Parameter = parameters.First(p => string.Equals(p.ParameterName, \"{parameterName}\", StringComparison.OrdinalIgnoreCase));");
+            builder.AppendLine($"        output.{parameter.PropertyName} = ConvertFromDbValue<{clrType}>({parameter.PropertyName}Parameter.Value);");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("        return output;");
         builder.AppendLine("    }");
         builder.AppendLine("}");
 
-        await WriteFileAsync(Path.Combine(projectRoot, "StoredProcedure", "Repositories", $"{entity.EntityName}StoredProcedureRepository.cs"), builder.ToString(), cancellationToken).ConfigureAwait(false);
+        await WriteFileAsync(Path.Combine(repositoryFolder, $"{className}StoredProcedureRepository.cs"), builder.ToString(), cancellationToken).ConfigureAwait(false);
     }
 
     private string BuildDbContext(TemplateMetadata metadata)
@@ -1224,6 +1411,57 @@ internal sealed class TemplateRenderer
         }
 
         return string.Empty;
+    }
+
+    private static string GetSqlDbType(string sqlTypeName)
+    {
+        return (sqlTypeName ?? string.Empty).ToLowerInvariant() switch
+        {
+            "bigint" => "SqlDbType.BigInt",
+            "binary" => "SqlDbType.Binary",
+            "bit" => "SqlDbType.Bit",
+            "char" => "SqlDbType.Char",
+            "date" => "SqlDbType.Date",
+            "datetime" => "SqlDbType.DateTime",
+            "datetime2" => "SqlDbType.DateTime2",
+            "datetimeoffset" => "SqlDbType.DateTimeOffset",
+            "decimal" => "SqlDbType.Decimal",
+            "float" => "SqlDbType.Float",
+            "image" => "SqlDbType.Image",
+            "int" => "SqlDbType.Int",
+            "money" => "SqlDbType.Money",
+            "nchar" => "SqlDbType.NChar",
+            "ntext" => "SqlDbType.NText",
+            "numeric" => "SqlDbType.Decimal",
+            "nvarchar" => "SqlDbType.NVarChar",
+            "real" => "SqlDbType.Real",
+            "smalldatetime" => "SqlDbType.SmallDateTime",
+            "smallint" => "SqlDbType.SmallInt",
+            "smallmoney" => "SqlDbType.SmallMoney",
+            "structured" => "SqlDbType.Structured",
+            "text" => "SqlDbType.Text",
+            "time" => "SqlDbType.Time",
+            "timestamp" => "SqlDbType.Timestamp",
+            "tinyint" => "SqlDbType.TinyInt",
+            "udt" => "SqlDbType.Udt",
+            "uniqueidentifier" => "SqlDbType.UniqueIdentifier",
+            "varbinary" => "SqlDbType.VarBinary",
+            "varchar" => "SqlDbType.VarChar",
+            "variant" => "SqlDbType.Variant",
+            "xml" => "SqlDbType.Xml",
+            "table" => "SqlDbType.Structured",
+            _ => "SqlDbType.Variant"
+        };
+    }
+
+    private static string GetParameterName(string rawName)
+    {
+        if (string.IsNullOrWhiteSpace(rawName))
+        {
+            return string.Empty;
+        }
+
+        return rawName.StartsWith("@", StringComparison.Ordinal) ? rawName : $"@{rawName}";
     }
 
     private static async Task WriteFileAsync(string path, string content, CancellationToken cancellationToken)
