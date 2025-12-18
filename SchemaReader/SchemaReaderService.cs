@@ -998,16 +998,18 @@ public sealed class SchemaReaderService : ISchemaReader
     {
         public static List<ParsedParameter> Parse(string definition, bool isFunction)
         {
+            var cleanedDefinition = RemoveSqlComments(definition);
+
             var header = isFunction
-                ? ExtractFunctionHeader(definition)
-                : ExtractProcedureHeader(definition);
+                ? ExtractFunctionHeader(cleanedDefinition)
+                : ExtractProcedureHeader(cleanedDefinition);
 
             if (header is null)
             {
                 return [];
             }
 
-            var parametersText = CleanupHeader(RemoveSqlComments(header));
+            var parametersText = CleanupHeader(header);
             var segments = SplitParameters(parametersText);
 
             return segments
