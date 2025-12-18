@@ -847,6 +847,18 @@ internal sealed class TemplateRenderer
         builder.AppendLine();
         builder.AppendLine($"public interface I{entity.EntityName}Service");
         builder.AppendLine("{");
+        builder.AppendLine($"    Task<IEnumerable<{entity.EntityName}Dto>> GetAllAsync(CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<{entity.EntityName}Dto?> GetByKeysAsync(object filters, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<{entity.EntityName}Dto>> QueryAsync(object? filters, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<PagedResult<{entity.EntityName}Dto>> QueryPagedAsync(object? filters, int pageNumber = 1, int pageSize = 50, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<{entity.EntityName}Dto>> SearchAsync(string text, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<{entity.EntityName}Dto>> FilterRangeAsync(string field, object from, object to, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<dynamic>> GroupByAsync(string field, object? filters = null, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<dynamic?> AggregateAsync(string field, string function, object? filters = null, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<{entity.EntityName}Dto>> TopAsync(string orderBy, int count, object? filters = null, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<bool> ExistsAsync(object filters, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<dynamic>> RawAsync(string sql, object? parameters = null, CancellationToken cancellationToken = default);");
+        builder.AppendLine($"    Task<IEnumerable<dynamic>> ExecuteStoredProcedureAsync(string spName, object? parameters = null, CancellationToken cancellationToken = default);");
         builder.AppendLine($"    Task<PagedResult<{entity.EntityName}Dto>> GetAsync(int pageNumber, int pageSize, CancellationToken cancellationToken = default);");
 
         if (entity.KeyProperties.Count == 1)
@@ -875,7 +887,6 @@ internal sealed class TemplateRenderer
     private async Task WriteServiceImplementationAsync(string projectRoot, EntityMetadata entity, CancellationToken cancellationToken)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("using Microsoft.EntityFrameworkCore;");
         builder.AppendLine($"using {_projectName}.Application.Contracts;");
         builder.AppendLine($"using {_projectName}.Application.Dtos;");
         builder.AppendLine($"using {_projectName}.ApplicationShared.Models;");
@@ -893,20 +904,96 @@ internal sealed class TemplateRenderer
         builder.AppendLine("        _repository = repository;");
         builder.AppendLine("    }");
         builder.AppendLine();
-        builder.AppendLine($"    public async Task<PagedResult<{entity.EntityName}Dto>> GetAsync(int pageNumber, int pageSize, CancellationToken cancellationToken = default)");
+        builder.AppendLine($"    public async Task<IEnumerable<{entity.EntityName}Dto>> GetAllAsync(CancellationToken cancellationToken = default)");
         builder.AppendLine("    {");
-        builder.AppendLine("        var query = _repository.Query();");
-        builder.AppendLine("        var total = await query.CountAsync(cancellationToken).ConfigureAwait(false);");
-        builder.AppendLine("        var entities = await query.AsNoTracking().Skip((pageNumber - 1) * pageSize).Take(pageSize).ToListAsync(cancellationToken).ConfigureAwait(false);");
-        builder.AppendLine("        var items = entities.Select(MapToDto).ToList();");
+        builder.AppendLine("        var entities = await _repository.GetAllAsync().ConfigureAwait(false);");
+        builder.AppendLine("        return entities.Select(MapToDto).ToList();");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<{entity.EntityName}Dto?> GetByKeysAsync(object filters, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        var entity = await _repository.GetByKeysAsync(filters).ConfigureAwait(false);");
+        builder.AppendLine("        return entity is null ? null : MapToDto(entity);");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<{entity.EntityName}Dto>> QueryAsync(object? filters, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        var entities = await _repository.QueryAsync(filters).ConfigureAwait(false);");
+        builder.AppendLine("        return entities.Select(MapToDto).ToList();");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<PagedResult<{entity.EntityName}Dto>> QueryPagedAsync(object? filters, int pageNumber = 1, int pageSize = 50, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        var result = await _repository.QueryPagedAsync(filters, pageNumber, pageSize).ConfigureAwait(false);");
+        builder.AppendLine("        var items = result.Items.Select(MapToDto).ToList();");
         builder.AppendLine();
         builder.AppendLine($"        return new PagedResult<{entity.EntityName}Dto>");
         builder.AppendLine("        {");
         builder.AppendLine("            Items = items,");
-        builder.AppendLine("            TotalCount = total,");
-        builder.AppendLine("            PageNumber = pageNumber,");
-        builder.AppendLine("            PageSize = pageSize");
+        builder.AppendLine("            TotalCount = result.TotalCount,");
+        builder.AppendLine("            PageNumber = result.PageNumber,");
+        builder.AppendLine("            PageSize = result.PageSize");
         builder.AppendLine("        };");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<{entity.EntityName}Dto>> SearchAsync(string text, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        var entities = await _repository.SearchAsync(text).ConfigureAwait(false);");
+        builder.AppendLine("        return entities.Select(MapToDto).ToList();");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<{entity.EntityName}Dto>> FilterRangeAsync(string field, object from, object to, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        var entities = await _repository.FilterRangeAsync(field, from, to).ConfigureAwait(false);");
+        builder.AppendLine("        return entities.Select(MapToDto).ToList();");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<dynamic>> GroupByAsync(string field, object? filters = null, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return await _repository.GroupByAsync(field, filters).ConfigureAwait(false);");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<dynamic?> AggregateAsync(string field, string function, object? filters = null, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return await _repository.AggregateAsync(field, function, filters).ConfigureAwait(false);");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<{entity.EntityName}Dto>> TopAsync(string orderBy, int count, object? filters = null, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        var entities = await _repository.TopAsync(orderBy, count, filters).ConfigureAwait(false);");
+        builder.AppendLine("        return entities.Select(MapToDto).ToList();");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<bool> ExistsAsync(object filters, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return await _repository.ExistsAsync(filters).ConfigureAwait(false);");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<dynamic>> RawAsync(string sql, object? parameters = null, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return await _repository.RawAsync(sql, parameters).ConfigureAwait(false);");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<IEnumerable<dynamic>> ExecuteStoredProcedureAsync(string spName, object? parameters = null, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return await _repository.ExecuteStoredProcedureAsync(spName, parameters).ConfigureAwait(false);");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+
+        builder.AppendLine($"    public async Task<PagedResult<{entity.EntityName}Dto>> GetAsync(int pageNumber, int pageSize, CancellationToken cancellationToken = default)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return await QueryPagedAsync(null, pageNumber, pageSize, cancellationToken).ConfigureAwait(false);");
         builder.AppendLine("    }");
         builder.AppendLine();
 
