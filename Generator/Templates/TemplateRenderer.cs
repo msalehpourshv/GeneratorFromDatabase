@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text;
 using Generator.Metadata;
 
@@ -44,14 +45,14 @@ internal sealed class TemplateRenderer
         var content = $$"""
             <Project Sdk="Microsoft.NET.Sdk">
               <PropertyGroup>
-                <TargetFramework>net10.0</TargetFramework>
+                <TargetFramework>net6.0</TargetFramework>
                 <Nullable>enable</Nullable>
                 <ImplicitUsings>enable</ImplicitUsings>
               </PropertyGroup>
               <ItemGroup>
-                <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
-                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
-                <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore" Version="6.0.27" />
+                <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="6.0.27" />
+                <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="6.0.0" />
               </ItemGroup>
             </Project>
             """;
@@ -70,14 +71,7 @@ internal sealed class TemplateRenderer
             namespace {{_projectName}}.DomainShared.Abstractions;
 
             [NotMapped]
-            public abstract class EntityBase
-            {
-                public Guid CorrelationId { get; set; } = Guid.NewGuid();
-
-                public DateTime CreatedOnUtc { get; set; } = DateTime.UtcNow;
-
-                public DateTime? ModifiedOnUtc { get; set; }
-            }
+            public abstract class EntityBase { }
             """;
 
         await WriteFileAsync(Path.Combine(projectRoot, "DomainShared", "Abstractions", "EntityBase.cs"), baseEntityContent, cancellationToken).ConfigureAwait(false);
@@ -115,7 +109,7 @@ internal sealed class TemplateRenderer
 
             public sealed class PagedResult<T>
             {
-                public required IReadOnlyList<T> Items { get; init; }
+                public IReadOnlyList<T> Items { get; init; } = Array.Empty<T>();
 
                 public int TotalCount { get; init; }
 
@@ -218,7 +212,10 @@ internal sealed class TemplateRenderer
 
                 protected async Task<int> ExecuteAsync(string storedProcedureName, IEnumerable<DbParameter> parameters, CancellationToken cancellationToken = default)
                 {
-                    ArgumentException.ThrowIfNullOrWhiteSpace(storedProcedureName);
+                    if (string.IsNullOrWhiteSpace(storedProcedureName))
+                    {
+                        throw new ArgumentException("Stored procedure name must be provided.", nameof(storedProcedureName));
+                    }
 
                     await using var command = Connection.CreateCommand();
                     command.CommandType = CommandType.StoredProcedure;
@@ -310,11 +307,6 @@ internal sealed class TemplateRenderer
         builder.AppendLine();
         builder.AppendLine($"namespace {_projectName}.Domain.Entities;");
         builder.AppendLine();
-
-        if (entity.KeyProperties.Count > 1)
-        {
-            builder.AppendLine($"[PrimaryKey({string.Join(", ", entity.KeyProperties.Select(p => $"nameof({p.PropertyName})"))})]");
-        }
 
         builder.AppendLine($"[Table(\"{entity.TableName}\", Schema = \"{entity.SchemaName}\")]");
         builder.AppendLine($"public sealed class {entity.EntityName} : EntityBase");
@@ -660,6 +652,23 @@ internal sealed class TemplateRenderer
         foreach (var entity in metadata.Entities)
         {
             builder.AppendLine($"    public DbSet<{entity.EntityName}> {entity.EntityName}Set => Set<{entity.EntityName}>();");
+        }
+
+        var compositeKeyEntities = metadata.Entities.Where(e => e.KeyProperties.Count > 1).ToList();
+        if (compositeKeyEntities.Count > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine("    protected override void OnModelCreating(ModelBuilder modelBuilder)");
+            builder.AppendLine("    {");
+            builder.AppendLine("        base.OnModelCreating(modelBuilder);");
+            builder.AppendLine();
+
+            foreach (var entity in compositeKeyEntities)
+            {
+                builder.AppendLine($"        modelBuilder.Entity<{entity.EntityName}>().HasKey(e => new {{ {string.Join(", ", entity.KeyProperties.Select(p => $"e.{p.PropertyName}"))} }});");
+            }
+
+            builder.AppendLine("    }");
         }
 
         builder.AppendLine("}");
