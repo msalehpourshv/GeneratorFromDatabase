@@ -119,6 +119,9 @@ public sealed class SchemaReaderService : ISchemaReader
         }
     }
 
+    public static string SchemaResultFilePath =>
+        Path.Combine(AppContext.BaseDirectory, "SchemaReader", "SchemaReaderResult.json");
+
     private static string BuildCacheKey(SqlConnectionStringBuilder builder)
     {
         var dataSource = string.IsNullOrWhiteSpace(builder.DataSource)
@@ -243,6 +246,7 @@ public sealed class SchemaReaderService : ISchemaReader
             _logger.LogInformation("No local database folder found for {Database}; skipping file overrides", connection.Database);
         }
 
+        await SaveSchemaResultAsync(schema, cancellationToken).ConfigureAwait(false);
         await WriteToCacheAsync(cacheKey, schema, signature, cancellationToken).ConfigureAwait(false);
 
         return new SchemaWithSignature(schema, signature);
@@ -1222,5 +1226,25 @@ public sealed class SchemaReaderService : ISchemaReader
             total,
             percent,
             name);
+    }
+
+    private async Task SaveSchemaResultAsync(DatabaseSchema schema, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(SchemaResultFilePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            var serialized = JsonSerializer.Serialize(schema, SerializerOptions);
+            await File.WriteAllTextAsync(SchemaResultFilePath, serialized, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Schema written to {Path}", SchemaResultFilePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write schema result to file {Path}", SchemaResultFilePath);
+        }
     }
 }
