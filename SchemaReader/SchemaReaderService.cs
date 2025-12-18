@@ -119,8 +119,15 @@ public sealed class SchemaReaderService : ISchemaReader
         }
     }
 
-    public static string SchemaResultFilePath =>
-        Path.Combine(AppContext.BaseDirectory, "SchemaReader", "SchemaReaderResult.json");
+    public static string SchemaResultFilePath => Path.GetFullPath(
+        Path.Combine(
+            AppContext.BaseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "SchemaReader",
+            "SchemaReaderResult.json"));
 
     private static string BuildCacheKey(SqlConnectionStringBuilder builder)
     {
