@@ -1003,7 +1003,7 @@ public sealed class SchemaReaderService : ISchemaReader
                 return [];
             }
 
-            var parametersText = CleanupHeader(header);
+            var parametersText = CleanupHeader(RemoveSqlComments(header));
             var segments = SplitParameters(parametersText);
 
             return segments
@@ -1034,6 +1034,17 @@ public sealed class SchemaReaderService : ISchemaReader
             }
 
             return cleaned;
+        }
+
+        private static string RemoveSqlComments(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+
+            var withoutBlockComments = Regex.Replace(text, "/\\*.*?\\*/", string.Empty, RegexOptions.Singleline);
+            return Regex.Replace(withoutBlockComments, "--.*?$", string.Empty, RegexOptions.Multiline);
         }
 
         private static List<string> SplitParameters(string header)
