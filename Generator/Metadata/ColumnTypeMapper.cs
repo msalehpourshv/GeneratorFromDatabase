@@ -6,9 +6,14 @@ internal static class ColumnTypeMapper
 {
     public static (string TypeName, bool IsReferenceType) MapToClrType(ColumnInfo column)
     {
-        var dataType = column.DataType.ToLowerInvariant();
+        return MapToClrType(column.DataType);
+    }
 
-        return dataType switch
+    public static (string TypeName, bool IsReferenceType) MapToClrType(string dataType)
+    {
+        var normalized = (dataType ?? string.Empty).ToLowerInvariant();
+
+        return normalized switch
         {
             "bigint" => ("long", false),
             "binary" or "varbinary" or "image" => ("byte[]", true),
