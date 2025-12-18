@@ -119,15 +119,9 @@ public sealed class SchemaReaderService : ISchemaReader
         }
     }
 
-    public static string SchemaResultFilePath => Path.GetFullPath(
-        Path.Combine(
-            AppContext.BaseDirectory,
-            "..",
-            "..",
-            "..",
-            "..",
-            "SchemaReader",
-            "SchemaReaderResult.json"));
+    private static readonly string SolutionRoot = ResolveSolutionRoot();
+
+    public static string SchemaResultFilePath => Path.Combine(SolutionRoot, "SchemaReader", "SchemaReaderResult.json");
 
     private static string BuildCacheKey(SqlConnectionStringBuilder builder)
     {
@@ -816,6 +810,25 @@ public sealed class SchemaReaderService : ISchemaReader
         {
             CommandTimeout = 60
         };
+    }
+
+    private static string ResolveSolutionRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        const string solutionFile = "GeneratorFromDatabase.sln";
+
+        while (current is not null && current.Exists)
+        {
+            var candidate = Path.Combine(current.FullName, solutionFile);
+            if (File.Exists(candidate))
+            {
+                return current.FullName;
+            }
+
+            current = current.Parent;
+        }
+
+        return AppContext.BaseDirectory;
     }
 
     private static string? ResolveDatabaseDirectory(string databaseName)
