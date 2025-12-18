@@ -71,14 +71,7 @@ internal sealed class TemplateRenderer
             namespace {{_projectName}}.DomainShared.Abstractions;
 
             [NotMapped]
-            public abstract class EntityBase
-            {
-                public Guid CorrelationId { get; set; } = Guid.NewGuid();
-
-                public DateTime CreatedOnUtc { get; set; } = DateTime.UtcNow;
-
-                public DateTime? ModifiedOnUtc { get; set; }
-            }
+            public abstract class EntityBase { }
             """;
 
         await WriteFileAsync(Path.Combine(projectRoot, "DomainShared", "Abstractions", "EntityBase.cs"), baseEntityContent, cancellationToken).ConfigureAwait(false);
