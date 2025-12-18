@@ -50,9 +50,12 @@ internal sealed class TemplateRenderer
                 <ImplicitUsings>enable</ImplicitUsings>
               </PropertyGroup>
               <ItemGroup>
+                <PackageReference Include="Dapper" Version="2.1.24" />
+                <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.1" />
                 <PackageReference Include="Microsoft.EntityFrameworkCore" Version="6.0.27" />
                 <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="6.0.27" />
                 <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="6.0.0" />
+                <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="6.0.0" />
               </ItemGroup>
             </Project>
             """;
@@ -78,11 +81,36 @@ internal sealed class TemplateRenderer
 
         var repositoryContent = $$"""
             using System.Linq.Expressions;
+            using {{_projectName}}.ApplicationShared.Models;
 
             namespace {{_projectName}}.DomainShared.Contracts;
 
             public interface IRepository<TEntity> where TEntity : class
             {
+                Task<IEnumerable<TEntity>> GetAllAsync();
+
+                Task<TEntity?> GetByKeysAsync(object filters);
+
+                Task<IEnumerable<TEntity>> QueryAsync(object? filters);
+
+                Task<PagedResult<TEntity>> QueryPagedAsync(object? filters, int page = 1, int pageSize = 50);
+
+                Task<IEnumerable<TEntity>> SearchAsync(string text);
+
+                Task<IEnumerable<TEntity>> FilterRangeAsync(string field, object from, object to);
+
+                Task<IEnumerable<dynamic>> GroupByAsync(string field, object? filters = null);
+
+                Task<dynamic?> AggregateAsync(string field, string function, object? filters = null);
+
+                Task<IEnumerable<TEntity>> TopAsync(string orderBy, int count, object? filters = null);
+
+                Task<bool> ExistsAsync(object filters);
+
+                Task<IEnumerable<dynamic>> RawAsync(string sql, object? parameters = null);
+
+                Task<IEnumerable<dynamic>> ExecuteStoredProcedureAsync(string spName, object? parameters = null);
+
                 IQueryable<TEntity> Query();
 
                 Task<TEntity?> FindAsync(object[] keyValues, CancellationToken cancellationToken = default);
@@ -128,14 +156,27 @@ internal sealed class TemplateRenderer
         await WriteFileAsync(Path.Combine(projectRoot, "EntityFramework", "Data", "AppDbContext.cs"), dbContextContent, cancellationToken).ConfigureAwait(false);
 
         var repositoryBaseContent = $$"""
+            using System.Data;
+            using System.Diagnostics;
             using System.Linq.Expressions;
-            using {{_projectName}}.DomainShared.Contracts;
+            using System.Reflection;
+            using Dapper;
+            using Microsoft.Data.SqlClient;
             using Microsoft.EntityFrameworkCore;
+            using Microsoft.EntityFrameworkCore.Infrastructure;
+            using Microsoft.EntityFrameworkCore.Metadata;
+            using Microsoft.Extensions.Logging;
+            using Microsoft.Extensions.Logging.Abstractions;
+            using {{_projectName}}.ApplicationShared.Models;
+            using {{_projectName}}.DomainShared.Contracts;
 
             namespace {{_projectName}}.EntityFramework.Repositories;
 
             public class EfRepository<TEntity> : IRepository<TEntity> where TEntity : class
             {
+                private readonly string? _connectionString;
+                private readonly string _tableName;
+                private readonly ILogger<EfRepository<TEntity>> _logger;
                 private readonly DbSet<TEntity> _set;
                 protected readonly DbContext Context;
 
@@ -143,6 +184,240 @@ internal sealed class TemplateRenderer
                 {
                     Context = context;
                     _set = Context.Set<TEntity>();
+                    _connectionString = Context.Database.GetConnectionString();
+                    _tableName = ResolveTableName();
+                    _logger = Context.GetService<ILoggerFactory>()?.CreateLogger<EfRepository<TEntity>>()
+                              ?? NullLogger<EfRepository<TEntity>>.Instance;
+                }
+
+                public async Task<IEnumerable<TEntity>> GetAllAsync()
+                {
+                    return await ExecuteSafe("GetAll", async () =>
+                    {
+                        var sql = $"SELECT * FROM {_tableName}";
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql}", sql);
+                        return await connection.QueryAsync<TEntity>(sql).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<TEntity?> GetByKeysAsync(object filters)
+                {
+                    return await ExecuteSafe("GetByKeys", async () =>
+                    {
+                        var (whereSql, parameters) = BuildWhereClause(filters, allowEmpty: false);
+                        var sql = $"SELECT * FROM {_tableName}{whereSql}";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryFirstOrDefaultAsync<TEntity>(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<TEntity>> QueryAsync(object? filters)
+                {
+                    return await ExecuteSafe("Query", async () =>
+                    {
+                        var (whereSql, parameters) = BuildWhereClause(filters);
+                        var sql = $"SELECT * FROM {_tableName}{whereSql}";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryAsync<TEntity>(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<PagedResult<TEntity>> QueryPagedAsync(object? filters, int page = 1, int pageSize = 50)
+                {
+                    return await ExecuteSafe("QueryPaged", async () =>
+                    {
+                        var (whereSql, parameters) = BuildWhereClause(filters);
+                        var defaultOrder = ResolveDefaultOrderBy();
+
+                        var sqlCount = $"SELECT COUNT(1) FROM {_tableName}{whereSql}";
+                        var sqlPage =
+                            $"SELECT * FROM {_tableName}{whereSql} ORDER BY {defaultOrder} OFFSET {(page - 1) * pageSize} ROWS FETCH NEXT {pageSize} ROWS ONLY";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+
+                        var total = await connection.ExecuteScalarAsync<int>(sqlCount, parameters).ConfigureAwait(false);
+                        var items = (await connection.QueryAsync<TEntity>(sqlPage, parameters).ConfigureAwait(false)).ToList();
+
+                        return new PagedResult<TEntity>
+                        {
+                            Items = items,
+                            TotalCount = total,
+                            PageNumber = page,
+                            PageSize = pageSize
+                        };
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<TEntity>> SearchAsync(string text)
+                {
+                    return await ExecuteSafe("Search", async () =>
+                    {
+                        var (_, stringProps, _, _) = InspectEntity();
+                        if (!stringProps.Any())
+                        {
+                            return Enumerable.Empty<TEntity>();
+                        }
+
+                        var like = $"%{text}%";
+                        var whereParts = stringProps.Select(p => $"[{p.Name}] LIKE @{p.Name}").ToArray();
+                        var sql = $"SELECT * FROM {_tableName} WHERE " + string.Join(" OR ", whereParts);
+
+                        var parameters = new DynamicParameters();
+                        foreach (var prop in stringProps)
+                        {
+                            parameters.Add($"@{prop.Name}", like);
+                        }
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryAsync<TEntity>(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<TEntity>> FilterRangeAsync(string field, object from, object to)
+                {
+                    return await ExecuteSafe("FilterRange", async () =>
+                    {
+                        var (_, _, numericProps, dateProps) = InspectEntity();
+                        var allowed = numericProps.Select(p => p.Name)
+                            .Concat(dateProps.Select(p => p.Name))
+                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                        if (!allowed.Contains(field))
+                        {
+                            throw new ArgumentException($"Field '{field}' is not numeric/date for range filtering.");
+                        }
+
+                        var sql = $"SELECT * FROM {_tableName} WHERE [{field}] BETWEEN @from AND @to";
+                        var parameters = new DynamicParameters();
+                        parameters.Add("@from", from);
+                        parameters.Add("@to", to);
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryAsync<TEntity>(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<dynamic>> GroupByAsync(string field, object? filters = null)
+                {
+                    return await ExecuteSafe("GroupBy", async () =>
+                    {
+                        ValidateField(field);
+
+                        var (_, _, numericProps, _) = InspectEntity();
+                        var numericNames = numericProps.Select(p => p.Name).ToList();
+
+                        var aggSelect = "COUNT(1) AS Count";
+                        if (numericNames.Any())
+                        {
+                            aggSelect += ", " + string.Join(", ", numericNames.Select(n => $"SUM([{n}]) AS Sum_{n}"));
+                        }
+
+                        var (whereSql, parameters) = BuildWhereClause(filters);
+                        var sql = $"SELECT [{field}], {aggSelect} FROM {_tableName}{whereSql} GROUP BY [{field}]";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryAsync(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<dynamic?> AggregateAsync(string field, string function, object? filters = null)
+                {
+                    return await ExecuteSafe("Aggregate", async () =>
+                    {
+                        var (_, _, numericProps, _) = InspectEntity();
+                        var allowed = numericProps.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                        var func = function.ToUpperInvariant();
+
+                        if (func != "SUM" && func != "COUNT" && func != "AVG")
+                        {
+                            throw new ArgumentException("Unsupported aggregate function. Use SUM, COUNT or AVG.");
+                        }
+
+                        if (!string.Equals(func, "COUNT", StringComparison.OrdinalIgnoreCase) && !allowed.Contains(field))
+                        {
+                            throw new ArgumentException($"Field '{field}' is not numeric for aggregate {function}.");
+                        }
+
+                        var (whereSql, parameters) = BuildWhereClause(filters);
+                        var sql = func == "COUNT"
+                            ? $"SELECT COUNT(1) AS Count FROM {_tableName}{whereSql}"
+                            : $"SELECT {func}([{field}]) AS Value FROM {_tableName}{whereSql}";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return (await connection.QueryAsync(sql, parameters).ConfigureAwait(false)).FirstOrDefault();
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<TEntity>> TopAsync(string orderBy, int count, object? filters = null)
+                {
+                    return await ExecuteSafe("Top", async () =>
+                    {
+                        var validatedOrderBy = ValidateOrderBy(orderBy);
+                        var (whereSql, parameters) = BuildWhereClause(filters);
+                        var sql = $"SELECT TOP({count}) * FROM {_tableName}{whereSql} ORDER BY {validatedOrderBy}";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryAsync<TEntity>(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<bool> ExistsAsync(object filters)
+                {
+                    return await ExecuteSafe("Exists", async () =>
+                    {
+                        var (whereSql, parameters) = BuildWhereClause(filters, allowEmpty: true);
+                        if (string.IsNullOrWhiteSpace(whereSql))
+                        {
+                            whereSql = " WHERE 1=1";
+                        }
+                        var sql = $"SELECT CASE WHEN EXISTS(SELECT 1 FROM {_tableName}{whereSql}) THEN 1 ELSE 0 END as ExistsFlag";
+
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        var result = await connection.ExecuteScalarAsync<int>(sql, parameters).ConfigureAwait(false);
+                        return result == 1;
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<dynamic>> RawAsync(string sql, object? parameters = null)
+                {
+                    return await ExecuteSafe("Raw", async () =>
+                    {
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("Raw SQL: {Sql} | Params: {Params}", sql, parameters);
+                        return await connection.QueryAsync(sql, parameters).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+
+                public async Task<IEnumerable<dynamic>> ExecuteStoredProcedureAsync(string spName, object? parameters = null)
+                {
+                    return await ExecuteSafe($"SP:{spName}", async () =>
+                    {
+                        await using var connection = CreateConnection();
+                        await connection.OpenAsync().ConfigureAwait(false);
+                        _logger.LogDebug("Calling SP: {SP} | Params: {Params}", spName, parameters);
+                        return await connection.QueryAsync(spName, parameters, commandType: CommandType.StoredProcedure).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
                 }
 
                 public IQueryable<TEntity> Query() => _set.AsQueryable();
@@ -182,6 +457,175 @@ internal sealed class TemplateRenderer
                 public async Task SaveChangesAsync(CancellationToken cancellationToken = default)
                 {
                     await Context.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                private SqlConnection CreateConnection()
+                {
+                    if (string.IsNullOrWhiteSpace(_connectionString))
+                    {
+                        throw new InvalidOperationException("Database connection string is not configured.");
+                    }
+
+                    return new SqlConnection(_connectionString);
+                }
+
+                private string ResolveTableName()
+                {
+                    IEntityType? entityType = Context.Model.FindEntityType(typeof(TEntity));
+                    if (entityType == null)
+                    {
+                        return $"[{typeof(TEntity).Name}]";
+                    }
+
+                    var schema = entityType.GetSchema();
+                    var tableName = entityType.GetTableName() ?? typeof(TEntity).Name;
+
+                    return string.IsNullOrWhiteSpace(schema) ? $"[{tableName}]" : $"[{schema}].[{tableName}]";
+                }
+
+                private async Task<T> ExecuteSafe<T>(string operation, Func<Task<T>> action)
+                {
+                    var sw = Stopwatch.StartNew();
+                    _logger.LogInformation("Starting DB operation {Operation} on {Table}", operation, _tableName);
+                    try
+                    {
+                        var result = await action().ConfigureAwait(false);
+                        sw.Stop();
+                        _logger.LogInformation("Completed {Operation} on {Table} in {Elapsed}ms", operation, _tableName, sw.ElapsedMilliseconds);
+                        return result;
+                    }
+                    catch (SqlException ex)
+                    {
+                        sw.Stop();
+                        _logger.LogError(ex, "SQL error during {Operation} on {Table}", operation, _tableName);
+                        throw new Exception($"Database error in {operation} for {_tableName}: {ex.Message}", ex);
+                    }
+                    catch (TimeoutException ex)
+                    {
+                        sw.Stop();
+                        _logger.LogError(ex, "Timeout during {Operation} on {Table}", operation, _tableName);
+                        throw new Exception($"Timeout in {operation} for {_tableName}: {ex.Message}", ex);
+                    }
+                    catch (Exception ex)
+                    {
+                        sw.Stop();
+                        _logger.LogError(ex, "Unexpected error during {Operation} on {Table}", operation, _tableName);
+                        throw new Exception($"Unexpected error in {operation} for {_tableName}: {ex.Message}", ex);
+                    }
+                }
+
+                private (PropertyInfo[] all, PropertyInfo[] stringProps, PropertyInfo[] numericProps, PropertyInfo[] dateProps) InspectEntity()
+                {
+                    var type = typeof(TEntity);
+                    var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                    var stringProps = props.Where(p => p.PropertyType == typeof(string)).ToArray();
+                    var numericProps = props.Where(p =>
+                        p.PropertyType == typeof(int) ||
+                        p.PropertyType == typeof(long) ||
+                        p.PropertyType == typeof(decimal) ||
+                        p.PropertyType == typeof(double) ||
+                        p.PropertyType == typeof(float) ||
+                        p.PropertyType == typeof(short) ||
+                        p.PropertyType == typeof(int?) ||
+                        p.PropertyType == typeof(long?) ||
+                        p.PropertyType == typeof(decimal?) ||
+                        p.PropertyType == typeof(double?) ||
+                        p.PropertyType == typeof(float?) ||
+                        p.PropertyType == typeof(short?)
+                    ).ToArray();
+                    var dateProps = props.Where(p => p.PropertyType == typeof(DateTime) || p.PropertyType == typeof(DateTime?)).ToArray();
+                    return (props, stringProps, numericProps, dateProps);
+                }
+
+                private (string whereSql, DynamicParameters parameters) BuildWhereClause(object? filters, bool allowEmpty = true)
+                {
+                    var where = new List<string>();
+                    var parameters = new DynamicParameters();
+                    var validProps = InspectEntity().all.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    if (filters != null)
+                    {
+                        if (filters is IDictionary<string, object?> dict)
+                        {
+                            foreach (var kv in dict)
+                            {
+                                if (kv.Value == null) continue;
+                                if (!validProps.Contains(kv.Key))
+                                {
+                                    throw new ArgumentException($"Property '{kv.Key}' is not valid for filtering.");
+                                }
+                                where.Add($"[{kv.Key}] = @{kv.Key}");
+                                parameters.Add($"@{kv.Key}", kv.Value);
+                            }
+                        }
+                        else
+                        {
+                            foreach (var prop in filters.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                            {
+                                var value = prop.GetValue(filters);
+                                if (value == null) continue;
+                                if (!validProps.Contains(prop.Name))
+                                {
+                                    throw new ArgumentException($"Property '{prop.Name}' is not valid for filtering.");
+                                }
+                                where.Add($"[{prop.Name}] = @{prop.Name}");
+                                parameters.Add($"@{prop.Name}", value);
+                            }
+                        }
+                    }
+
+                    if (!where.Any() && !allowEmpty)
+                    {
+                        throw new ArgumentException("At least one filter value must be provided.");
+                    }
+
+                    var whereSql = where.Count == 0 ? string.Empty : " WHERE " + string.Join(" AND ", where);
+
+                    return (whereSql, parameters);
+                }
+
+                private string ResolveDefaultOrderBy()
+                {
+                    var entityType = Context.Model.FindEntityType(typeof(TEntity));
+                    var keyProps = entityType?.FindPrimaryKey()?.Properties;
+
+                    if (keyProps != null && keyProps.Any())
+                    {
+                        return string.Join(", ", keyProps.Select(p => $"[{p.Name}] DESC"));
+                    }
+
+                    var (allProps, _, _, _) = InspectEntity();
+                    return allProps.Length > 0 ? $"[{allProps[0].Name}] DESC" : "[Id] DESC";
+                }
+
+                private void ValidateField(string field)
+                {
+                    var validProps = InspectEntity().all.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    if (!validProps.Contains(field))
+                    {
+                        throw new ArgumentException($"Field '{field}' is not valid for this entity.");
+                    }
+                }
+
+                private string ValidateOrderBy(string orderBy)
+                {
+                    var parts = orderBy.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length == 0)
+                    {
+                        throw new ArgumentException("Order by clause cannot be empty.");
+                    }
+
+                    var field = parts[0];
+                    ValidateField(field);
+
+                    var direction = parts.Length > 1 ? parts[1] : "ASC";
+                    if (!direction.Equals("ASC", StringComparison.OrdinalIgnoreCase) &&
+                        !direction.Equals("DESC", StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new ArgumentException("Order by direction must be either ASC or DESC.");
+                    }
+
+                    return $"[{field}] {direction.ToUpperInvariant()}";
                 }
             }
             """;
