@@ -1054,12 +1054,29 @@ public sealed class SchemaReaderService : ISchemaReader
         private static string CleanupHeader(string header)
         {
             var cleaned = header.Trim();
-            if (cleaned.StartsWith("(") && cleaned.EndsWith(")"))
+
+            if (cleaned.StartsWith("(", StringComparison.Ordinal))
             {
-                cleaned = cleaned[1..^1];
+                var depth = 0;
+                for (var i = 0; i < cleaned.Length; i++)
+                {
+                    var ch = cleaned[i];
+                    if (ch == '(')
+                    {
+                        depth++;
+                    }
+                    else if (ch == ')')
+                    {
+                        depth = Math.Max(0, depth - 1);
+                        if (depth == 0)
+                        {
+                            return cleaned[1..i].Trim();
+                        }
+                    }
+                }
             }
 
-            return cleaned;
+            return cleaned.Trim('(', ')');
         }
 
         private static string RemoveSqlComments(string text)
