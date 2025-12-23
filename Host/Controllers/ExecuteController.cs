@@ -11,12 +11,14 @@ public sealed class ExecuteController : ControllerBase
     private readonly GeneratorService _generator;
     private readonly IConfiguration _config;
     private readonly ISchemaReader _schemaReader;
+    private readonly ILogger<ExecuteController> _logger;
 
-    public ExecuteController(GeneratorService generator, IConfiguration config, ISchemaReader schemaReader)
+    public ExecuteController(GeneratorService generator, IConfiguration config, ISchemaReader schemaReader, ILogger<ExecuteController> logger)
     {
         _schemaReader = schemaReader;
         _generator = generator;
         _config = config;
+        _logger = logger;
     }
 
     [HttpPost("generate")]
@@ -27,13 +29,23 @@ public sealed class ExecuteController : ControllerBase
     }
 
     [HttpGet("schema")]
-    public async Task<ActionResult<DatabaseSchema>> ExecuteReadSchema(CancellationToken cancellationToken)
+    public async Task<IActionResult> ExecuteReadSchema(CancellationToken cancellationToken)
     {
-        string conn = _config.GetConnectionString("DefaultConnection") ?? "";
+        var conn = _config.GetConnectionString("DefaultConnection") ?? string.Empty;
 
-        DatabaseSchema schema = await _schemaReader.ReadSchemaAsync(conn, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _schemaReader.ReadSchemaAsync(conn, cancellationToken).ConfigureAwait(false);
+            var message = $"انجام شد. خروجی در مسیر {SchemaReaderService.SchemaResultFilePath} ذخیره شد.";
+            return Ok(new { status = "success", message });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to read schema");
+            var message = $"انجام نشد: {ex.Message}";
+            return StatusCode(StatusCodes.Status500InternalServerError, new { status = "error", message });
+        }
 
-        return schema;
     }
 }
 

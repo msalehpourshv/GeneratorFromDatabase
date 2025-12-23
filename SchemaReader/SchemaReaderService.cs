@@ -119,6 +119,10 @@ public sealed class SchemaReaderService : ISchemaReader
         }
     }
 
+    private static readonly string SolutionRoot = ResolveSolutionRoot();
+
+    public static string SchemaResultFilePath => Path.Combine(SolutionRoot, "SchemaReader", "SchemaReaderResult.json");
+
     private static string BuildCacheKey(SqlConnectionStringBuilder builder)
     {
         var dataSource = string.IsNullOrWhiteSpace(builder.DataSource)
@@ -243,6 +247,7 @@ public sealed class SchemaReaderService : ISchemaReader
             _logger.LogInformation("No local database folder found for {Database}; skipping file overrides", connection.Database);
         }
 
+        await SaveSchemaResultAsync(schema, cancellationToken).ConfigureAwait(false);
         await WriteToCacheAsync(cacheKey, schema, signature, cancellationToken).ConfigureAwait(false);
 
         return new SchemaWithSignature(schema, signature);
@@ -807,6 +812,25 @@ public sealed class SchemaReaderService : ISchemaReader
         };
     }
 
+    private static string ResolveSolutionRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        const string solutionFile = "GeneratorFromDatabase.sln";
+
+        while (current is not null && current.Exists)
+        {
+            var candidate = Path.Combine(current.FullName, solutionFile);
+            if (File.Exists(candidate))
+            {
+                return current.FullName;
+            }
+
+            current = current.Parent;
+        }
+
+        return AppContext.BaseDirectory;
+    }
+
     private static string? ResolveDatabaseDirectory(string databaseName)
     {
         if (string.IsNullOrWhiteSpace(databaseName))
@@ -994,9 +1018,11 @@ public sealed class SchemaReaderService : ISchemaReader
     {
         public static List<ParsedParameter> Parse(string definition, bool isFunction)
         {
+            var cleanedDefinition = RemoveSqlComments(definition);
+
             var header = isFunction
-                ? ExtractFunctionHeader(definition)
-                : ExtractProcedureHeader(definition);
+                ? ExtractFunctionHeader(cleanedDefinition)
+                : ExtractProcedureHeader(cleanedDefinition);
 
             if (header is null)
             {
@@ -1034,6 +1060,17 @@ public sealed class SchemaReaderService : ISchemaReader
             }
 
             return cleaned;
+        }
+
+        private static string RemoveSqlComments(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+
+            var withoutBlockComments = Regex.Replace(text, "/\\*.*?\\*/", string.Empty, RegexOptions.Singleline);
+            return Regex.Replace(withoutBlockComments, "--.*?$", string.Empty, RegexOptions.Multiline);
         }
 
         private static List<string> SplitParameters(string header)
@@ -1211,5 +1248,25 @@ public sealed class SchemaReaderService : ISchemaReader
             total,
             percent,
             name);
+    }
+
+    private async Task SaveSchemaResultAsync(DatabaseSchema schema, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(SchemaResultFilePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            var serialized = JsonSerializer.Serialize(schema, SerializerOptions);
+            await File.WriteAllTextAsync(SchemaResultFilePath, serialized, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Schema written to {Path}", SchemaResultFilePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write schema result to file {Path}", SchemaResultFilePath);
+        }
     }
 }

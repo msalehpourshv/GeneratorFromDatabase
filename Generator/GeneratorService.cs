@@ -1,8 +1,9 @@
-using System.Text.Json;
 using Generator.Metadata;
 using Generator.Templates;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using SchemaReader;
+using System.Text.Json;
 
 namespace Generator;
 
@@ -24,14 +25,14 @@ public sealed class GeneratorService
 
         _logger.LogInformation("Using schema snapshot at {SchemaPath}", schemaPath);
 
-        var snapshot = await LoadSchemaSnapshotAsync(schemaPath, cancellationToken).ConfigureAwait(false);
-        if (snapshot.Schema is null)
+        var schema = await LoadSchemaSnapshotAsync(schemaPath, cancellationToken).ConfigureAwait(false);
+        if (schema is null)
         {
             throw new InvalidOperationException("Schema snapshot is missing the schema payload.");
         }
 
         var metadataBuilder = new TemplateMetadataBuilder();
-        var metadata = metadataBuilder.Build(snapshot.Schema, _options.CustomLibraryName, _options.ExcludedTables);
+        var metadata = metadataBuilder.Build(schema, _options.CustomLibraryName, _options.ExcludedTables);
 
         var outputDirectory = Path.Combine(_options.CustomLibraryPath, _options.OutputDirectoryName);
         Directory.CreateDirectory(outputDirectory);
@@ -48,7 +49,7 @@ public sealed class GeneratorService
 
         return new GeneratorResult
         {
-            Status = string.IsNullOrWhiteSpace(snapshot.Status) ? "Completed" : snapshot.Status,
+            Connection = schema.Connection,
             SchemaPath = schemaPath,
             MetadataPath = metadataPath,
             ProjectPath = projectRoot,
@@ -78,7 +79,7 @@ public sealed class GeneratorService
         return Path.Combine(solutionRoot, libraryName);
     }
 
-    private static async Task<SchemaSnapshot> LoadSchemaSnapshotAsync(string path, CancellationToken cancellationToken)
+    private static async Task<DatabaseSchema> LoadSchemaSnapshotAsync(string path, CancellationToken cancellationToken)
     {
         if (!File.Exists(path))
         {
@@ -86,16 +87,16 @@ public sealed class GeneratorService
         }
 
         await using var stream = File.OpenRead(path);
-        var snapshot = await JsonSerializer.DeserializeAsync<SchemaSnapshot>(stream, new JsonSerializerOptions(JsonSerializerDefaults.General)
+        var schema = await JsonSerializer.DeserializeAsync<DatabaseSchema>(stream, new JsonSerializerOptions(JsonSerializerDefaults.General)
         {
             PropertyNameCaseInsensitive = true
         }, cancellationToken).ConfigureAwait(false);
 
-        if (snapshot is null)
+        if (schema is null)
         {
             throw new InvalidOperationException("Unable to deserialize schema snapshot.");
         }
 
-        return snapshot;
+        return schema;
     }
 }

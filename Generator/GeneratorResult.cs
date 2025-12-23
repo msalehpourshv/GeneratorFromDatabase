@@ -5,7 +5,7 @@ namespace Generator;
 public sealed class GeneratorResult
 {
 
-    public string Status { get; init; } = "Pending";
+    public string Connection { get; init; } = "";
 
     public string? SchemaPath { get; init; }
 
